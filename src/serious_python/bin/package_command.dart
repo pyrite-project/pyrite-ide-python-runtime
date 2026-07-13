@@ -9,23 +9,45 @@ import 'package:glob/list_local_fs.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as path;
 import 'package:shelf/shelf.dart';
+import 'package:serious_python/src/python_versions.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 
 import 'macos_utils.dart' as macos_utils;
 import 'sitecustomize.dart';
 
 const mobilePyPiUrl = "https://pypi.flet.dev";
-const pyodideRootUrl = "https://cdn.jsdelivr.net/pyodide/v0.27.7/full";
 const pyodideLockFile = "pyodide-lock.json";
 
-const buildPythonVersion = "3.12.9";
-const buildPythonReleaseDate = "20250205";
 const defaultSitePackagesDir = "__pypackages__";
 const sitePackagesEnvironmentVariable = "SERIOUS_PYTHON_SITE_PACKAGES";
+// Staging dir for the processed app (copy/compile/cleanup output). When set,
+// native platforms (macOS/iOS/Windows/Linux/Android) consume the unpacked app
+// from here and do NOT receive an `app.zip` asset; web (Emscripten) still gets
+// the zip.
+const appEnvironmentVariable = "SERIOUS_PYTHON_APP";
 const flutterPackagesFlutterEnvironmentVariable =
     "SERIOUS_PYTHON_FLUTTER_PACKAGES";
 const allowSourceDistrosEnvironmentVariable =
     "SERIOUS_PYTHON_ALLOW_SOURCE_DISTRIBUTIONS";
+// Swift Package Manager (darwin) host-side staging. For iOS/macOS the package
+// command runs the SPM equivalent of the podspec `prepare_command` — assembling
+// the dist and mapping it into the plugin's Package.swift layout — since SPM has
+// no pod-install hook. SPM is Flutter's default darwin integration since 3.44, so
+// this happens **by default**; set `SERIOUS_PYTHON_DARWIN_SPM` to a falsy value
+// (0/false/no/off) to opt out and build with CocoaPods (e.g. `flet build` sets it
+// false when the app uses a non-SPM plugin). `SERIOUS_PYTHON_DARWIN_DIR` optionally
+// overrides the resolved plugin `darwin/` dir; `SERIOUS_PYTHON_SPM_KEY_FILE` overrides
+// where the SP_NATIVE_SET cache-bust key is written for the caller to export into the
+// `flutter build` environment.
+const darwinSpmEnvironmentVariable = "SERIOUS_PYTHON_DARWIN_SPM";
+const darwinDirEnvironmentVariable = "SERIOUS_PYTHON_DARWIN_DIR";
+const spmKeyFileEnvironmentVariable = "SERIOUS_PYTHON_SPM_KEY_FILE";
+
+// Python runtime version data — `defaultPythonVersion`, `pythonReleases`, the
+// `*EnvironmentVariable` names, `dartBridgeVersion`, `pythonReleaseDate` — lives
+// in the generated `lib/src/python_versions.dart` (imported above). It is a
+// snapshot of python-build's manifest.json; regenerate with
+// `dart run serious_python:gen_version_tables`.
 
 const platforms = {
   "iOS": {
@@ -40,13 +62,19 @@ const platforms = {
     }
   },
   "Android": {
-    "arm64-v8a": {"tag": "android-24-arm64-v8a", "mac_ver": ""},
-    "armeabi-v7a": {"tag": "android-24-armeabi-v7a", "mac_ver": ""},
+    // The ABI segment uses '_' so that packaging.tags.android_platforms (3.13+
+    // pip vendored packaging) — which derives the abi from
+    // `sysconfig.get_platform().split("-")[-1]` — picks up the full ABI
+    // (e.g. "arm64_v8a") rather than just the trailing token.
+    "arm64-v8a": {"tag": "android-24-arm64_v8a", "mac_ver": ""},
+    "armeabi-v7a": {"tag": "android-24-armeabi_v7a", "mac_ver": ""},
     "x86_64": {"tag": "android-24-x86_64", "mac_ver": ""},
-    "x86": {"tag": "android-24-x86", "mac_ver": ""}
   },
-  "Pyodide": {
-    "": {"tag": "pyodide-2024.0-wasm32", "mac_ver": ""}
+  "Emscripten": {
+    // The actual wheel platform tag is resolved per Python release from
+    // `pythonReleases[...].pyodidePlatformTag` (see sitecustomize wiring
+    // below) since it changes with each Pyodide ABI bump.
+    "": {"tag": "", "mac_ver": ""}
   },
   "Darwin": {
     "arm64": {"tag": "", "mac_ver": "arm64"},
@@ -86,6 +114,25 @@ class PackageCommand extends Command {
   bool _verbose = false;
   Directory? _buildDir;
   Directory? _pythonDir;
+  late String _pythonShortVersion;
+  late PythonRelease _release;
+
+  String get _pyodideRootUrl =>
+      "https://cdn.jsdelivr.net/pyodide/v${_release.pyodideVersion}/full";
+
+  /// Root of the cross-plugin download cache. Honors `FLET_CACHE_DIR` (the
+  /// same env var `flet build` and the Android gradle task already use) and
+  /// otherwise falls back to `~/.flet/cache` (`%USERPROFILE%\.flet\cache`
+  /// on Windows). The CMake/shell plugins resolve this independently to the
+  /// same path — keep the layout in sync.
+  String _fletCacheRoot() {
+    final env = Platform.environment['FLET_CACHE_DIR'];
+    if (env != null && env.isNotEmpty) return env;
+    final home = Platform.environment['HOME'] ??
+        Platform.environment['USERPROFILE'] ??
+        _buildDir!.path;
+    return path.join(home, '.flet', 'cache');
+  }
 
   @override
   final name = "package";
@@ -96,9 +143,14 @@ class PackageCommand extends Command {
   PackageCommand() {
     argParser.addOption('platform',
         abbr: "p",
-        allowed: ["iOS", "Android", "Pyodide", "Windows", "Linux", "Darwin"],
+        allowed: ["iOS", "Android", "Emscripten", "Windows", "Linux", "Darwin"],
         mandatory: true,
         help: "Install dependencies for specific platform, e.g. 'Android'.");
+    argParser.addOption('python-version',
+        allowed: pythonReleases.keys.toList(),
+        help: "Short Python version to bundle (e.g. 3.13). Defaults to "
+            "\$$pythonVersionEnvironmentVariable env var or "
+            "'$defaultPythonVersion'.");
     argParser.addMultiOption('arch',
         help:
             "Install dependencies for specific architectures only. Leave empty to install all supported architectures.");
@@ -161,6 +213,8 @@ class PackageCommand extends Command {
       List<String> archArg = argResults?['arch'];
       List<String> requirements = argResults?['requirements'];
       String? assetPath = argResults?['asset'];
+      final legacyAssetRequested =
+          assetPath != null && assetPath.trim().isNotEmpty;
       List<String> exclude = argResults?['exclude'];
       bool skipSitePackages = argResults?["skip-site-packages"];
       bool compileApp = argResults?["compile-app"];
@@ -171,6 +225,34 @@ class PackageCommand extends Command {
       bool cleanupPackages = argResults?["cleanup-packages"];
       List<String> cleanupPackageFiles = argResults?['cleanup-package-files'];
       _verbose = argResults?["verbose"];
+
+      _pythonShortVersion = argResults?['python-version'] ??
+          Platform.environment[pythonVersionEnvironmentVariable] ??
+          defaultPythonVersion;
+      final baseRelease = pythonReleases[_pythonShortVersion];
+      if (baseRelease == null) {
+        stderr.writeln(
+            "Unknown Python version: $_pythonShortVersion. Supported: ${pythonReleases.keys.join(", ")}");
+        exit(2);
+      }
+      _release = PythonRelease(
+        standaloneVersion:
+            Platform.environment[pythonFullVersionEnvironmentVariable] ??
+                baseRelease.standaloneVersion,
+        standaloneReleaseDate:
+            Platform.environment[pythonDistReleaseEnvironmentVariable] ??
+                baseRelease.standaloneReleaseDate,
+        pyodideVersion:
+            Platform.environment[pyodideVersionEnvironmentVariable] ??
+                baseRelease.pyodideVersion,
+        pyodidePlatformTag: baseRelease.pyodidePlatformTag,
+        androidAbis: baseRelease.androidAbis,
+        prerelease: baseRelease.prerelease,
+      );
+      final preNote = _release.prerelease ? " — pre-release" : "";
+      stdout.writeln(
+          "Python $_pythonShortVersion$preNote (CPython ${_release.standaloneVersion}, "
+          "Pyodide ${_release.pyodideVersion})");
 
       if (path.isRelative(sourceDirPath)) {
         sourceDirPath = path.join(currentPath, sourceDirPath);
@@ -195,13 +277,13 @@ class PackageCommand extends Command {
       }
 
       bool isMobile = (platform == "iOS" || platform == "Android");
-      bool isWeb = platform == "Pyodide";
+      bool isWeb = platform == "Emscripten";
 
       var junkFiles = isMobile ? junkFilesMobile : junkFilesDesktop;
 
       // Extra indexs
       List<String> extraPyPiIndexes = [mobilePyPiUrl];
-      if (platform == "Pyodide") {
+      if (platform == "Emscripten") {
         pyodidePyPiServer = await startSimpleServer();
         extraPyPiIndexes.add(
             "http://${pyodidePyPiServer.address.host}:${pyodidePyPiServer.port}/simple");
@@ -215,16 +297,17 @@ class PackageCommand extends Command {
         await _buildDir!.create();
       }
 
-      // asset path
+      // Web always produces an app asset. Native targets normally stage an
+      // unpacked app, but an explicit --asset keeps the legacy archive flow
+      // used for Pyrite's runtime boot scripts.
       if (assetPath == null) {
         assetPath = "app/app.zip";
       } else if (assetPath.startsWith("/") || assetPath.startsWith("\\")) {
         assetPath = assetPath.substring(1);
       }
 
-      // create dest dir
       final dest = File(path.join(currentPath, assetPath));
-      if (!await dest.parent.exists()) {
+      if ((isWeb || legacyAssetRequested) && !await dest.parent.exists()) {
         stdout.writeln("Creating asset directory: ${dest.parent.path}");
         await dest.parent.create(recursive: true);
       }
@@ -260,23 +343,27 @@ class PackageCommand extends Command {
         await cleanupDir(tempDir, allJunkFiles);
       }
 
+      // site-packages root
+      String sitePackagesRoot =
+          path.join(currentPath, "build", "site-packages");
+      if (Platform.environment.containsKey(sitePackagesEnvironmentVariable)) {
+        final envValue = Platform.environment[sitePackagesEnvironmentVariable];
+        if (envValue != null && envValue.isNotEmpty) {
+          sitePackagesRoot = envValue;
+        }
+      }
+
+      // app staging dir (native platforms only): when set, the processed app is
+      // copied here for the platform native build to place into the bundle, and
+      // no `app.zip` asset is produced. Web keeps the zip.
+      final appPackageRootEnv = Platform.environment[appEnvironmentVariable];
+      final appPackageRoot =
+          (appPackageRootEnv != null && appPackageRootEnv.isNotEmpty)
+              ? appPackageRootEnv
+              : null;
+
       // install requirements
       if (requirements.isNotEmpty && !skipSitePackages) {
-        String? sitePackagesRoot;
-
-        if (platform != "Pyodide") {
-          if (Platform.environment
-              .containsKey(sitePackagesEnvironmentVariable)) {
-            sitePackagesRoot =
-                Platform.environment[sitePackagesEnvironmentVariable];
-          }
-          if (sitePackagesRoot == null || sitePackagesRoot.isEmpty) {
-            sitePackagesRoot = path.join(currentPath, "build", "site-packages");
-          }
-        } else {
-          sitePackagesRoot = path.join(tempDir.path, defaultSitePackagesDir);
-        }
-
         if (await Directory(sitePackagesRoot).exists()) {
           await for (var f in Directory(sitePackagesRoot)
               .list()
@@ -289,6 +376,15 @@ class PackageCommand extends Command {
         // invoke pip for every platform arch
         for (var arch in platforms[platform]!.entries) {
           if (archArg.isNotEmpty && !archArg.contains(arch.key)) {
+            continue;
+          }
+          // Only install wheels for ABIs python-build publishes for this
+          // minor (per python-build's manifest `android_abis`); installing
+          // for an unpublished ABI would be wasted work.
+          if (platform == "Android" &&
+              !pythonReleases[_pythonShortVersion]!
+                  .androidAbis
+                  .contains(arch.key)) {
             continue;
           }
           String? sitePackagesDir;
@@ -310,10 +406,17 @@ class PackageCommand extends Command {
                   "Configured $platform/${arch.key} platform with sitecustomize.py");
             }
 
+            // Emscripten's wheel platform tag changes between Pyodide ABI
+            // bumps (e.g. pyodide-2024.0 -> pyodide-2025.0 -> pyemscripten-2026.0),
+            // so resolve it from the chosen Python release instead of the
+            // static `platforms` map.
+            final platformTag = platform == "Emscripten"
+                ? _release.pyodidePlatformTag
+                : arch.value["tag"]!;
             await File(sitecustomizePath).writeAsString(sitecustomizePy
                 .replaceAll(
-                    "{platform}", arch.value["tag"]!.isNotEmpty ? platform : "")
-                .replaceAll("{tag}", arch.value["tag"]!)
+                    "{platform}", platformTag.isNotEmpty ? platform : "")
+                .replaceAll("{tag}", platformTag)
                 .replaceAll("{mac_ver}", arch.value["mac_ver"]!));
 
             // print(File(sitecustomizePath).readAsStringSync());
@@ -324,6 +427,9 @@ class PackageCommand extends Command {
               // Prevent importing user-site packages (e.g. ~/.local/.../site-packages)
               // which can shadow bundled pip in build Python.
               "PYTHONNOUSERSITE": "1",
+              // Override any user-set `require-virtualenv = true` (pip.conf or
+              // PIP_REQUIRE_VIRTUALENV) which otherwise aborts the install.
+              "PIP_REQUIRE_VIRTUALENV": "false",
             };
 
             sitePackagesDir = arch.key.isNotEmpty
@@ -432,15 +538,59 @@ class PackageCommand extends Command {
         }
       }
 
-      // create archive
-      stdout.writeln(
-          "Creating app archive at ${dest.path} from a temp directory");
-      await zipDirectoryPosix(tempDir, dest);
+      // copy site packages to temp dir for web platform
+      if (platform == "Emscripten" && requirements.isNotEmpty) {
+        final sitePackagesSrcDir = Directory(sitePackagesRoot);
+        if (await sitePackagesSrcDir.exists()) {
+          stdout.writeln("Copying site packages to app archive");
+          final webPkgDir =
+              Directory(path.join(tempDir.path, defaultSitePackagesDir));
+          if (!await webPkgDir.exists()) {
+            await webPkgDir.create(recursive: true);
+          }
+          await copyDirectory(
+              sitePackagesSrcDir, webPkgDir, sitePackagesSrcDir.path, []);
+        }
+      }
 
-      // create hash file
-      stdout.writeln("Writing app archive hash to ${dest.path}.hash");
-      await File("${dest.path}.hash")
-          .writeAsString(await calculateFileHash(dest.path));
+      if (isWeb || legacyAssetRequested) {
+        stdout.writeln(
+            "Creating app archive at ${dest.path} from a temp directory");
+        await zipDirectoryPosix(tempDir, dest);
+
+        // create hash file
+        stdout.writeln("Writing app archive hash to ${dest.path}.hash");
+        await File("${dest.path}.hash")
+            .writeAsString(await calculateFileHash(dest.path));
+      }
+
+      if (!isWeb && appPackageRoot != null) {
+        // Native platforms: stage the unpacked app for the platform native
+        // build to copy into the bundle (Android zips it as a stored asset).
+        final appStagingDir = Directory(appPackageRoot);
+        stdout.writeln("Staging unpacked app to ${appStagingDir.path}");
+        if (await appStagingDir.exists()) {
+          await appStagingDir.delete(recursive: true);
+        }
+        await appStagingDir.create(recursive: true);
+        await copyDirectory(tempDir, appStagingDir, tempDir.path, []);
+
+        // Swift Package Manager (darwin) host-side staging: the podspec
+        // prepare_command doesn't run under SPM, so assemble the dist and map it
+        // into the plugin's Package.swift layout here (app is now staged). SPM is
+        // Flutter's default darwin integration since 3.44, so this runs **by
+        // default**; set `SERIOUS_PYTHON_DARWIN_SPM` to a falsy value (0/false/
+        // no/off) to opt out and build with CocoaPods (the podspec stages then).
+        if ((platform == "iOS" || platform == "Darwin") &&
+            !_isFalsy(Platform.environment[darwinSpmEnvironmentVariable])) {
+          await _stageDarwinSpm(platform, currentPath);
+        }
+      } else if (!isWeb && !legacyAssetRequested) {
+        throw Exception(
+            "$appEnvironmentVariable environment variable must be set for "
+            "$platform packaging (staging dir for the unpacked app), or an "
+            "explicit --asset must be provided for legacy asset packaging.");
+      }
     } catch (e) {
       stdout.writeln("Error: $e");
     } finally {
@@ -519,6 +669,66 @@ class PackageCommand extends Command {
     return proc.exitCode;
   }
 
+  static bool _isFalsy(String? v) =>
+      v != null && const ["0", "false", "no", "off"].contains(v.toLowerCase());
+
+  // Run the darwin SPM staging (prepare_spm.sh: assemble dist + map into the
+  // plugin's Package.swift layout) and persist the SP_NATIVE_SET cache-bust key
+  // for `flet build` to export into the `flutter build` environment.
+  Future<void> _stageDarwinSpm(String platform, String projectPath) async {
+    final darwinDir = await _resolveDarwinDir(projectPath);
+    if (darwinDir == null) {
+      stdout.writeln(
+          "SPM staging skipped: could not resolve serious_python_darwin "
+          "(set $darwinDirEnvironmentVariable or ensure "
+          ".dart_tool/package_config.json is present).");
+      return;
+    }
+    final spmPlatform = platform == "iOS" ? "ios" : "macos";
+    final script = path.join(darwinDir, "prepare_spm.sh");
+    stdout.writeln("SPM: staging $spmPlatform via $script");
+    final result = await Process.run("/bin/sh", [script, spmPlatform],
+        workingDirectory: darwinDir);
+    if ((result.stderr as String).isNotEmpty) {
+      verbose(result.stderr as String);
+    }
+    if (result.exitCode != 0) {
+      throw Exception("prepare_spm.sh failed (exit ${result.exitCode}):\n"
+          "${result.stderr}");
+    }
+    // stage_spm.sh prints the key as its last stdout line.
+    final key = (result.stdout as String)
+        .trim()
+        .split("\n")
+        .where((l) => l.trim().isNotEmpty)
+        .last
+        .trim();
+    final keyFile = Platform.environment[spmKeyFileEnvironmentVariable] ??
+        path.join(projectPath, "build", ".serious_python_spm_key");
+    await File(keyFile).parent.create(recursive: true);
+    await File(keyFile).writeAsString(key);
+    stdout.writeln("SPM: SP_NATIVE_SET=$key -> $keyFile");
+  }
+
+  // Resolve serious_python_darwin's `darwin/` directory — an explicit override
+  // (set by flet) wins, else read the flutter project's package config.
+  Future<String?> _resolveDarwinDir(String projectPath) async {
+    final override = Platform.environment[darwinDirEnvironmentVariable];
+    if (override != null && override.isNotEmpty) return override;
+    final pc =
+        File(path.join(projectPath, ".dart_tool", "package_config.json"));
+    if (!await pc.exists()) return null;
+    final data = jsonDecode(await pc.readAsString()) as Map<String, dynamic>;
+    for (final pkg in (data["packages"] as List)) {
+      if (pkg["name"] == "serious_python_darwin") {
+        final base = Uri.directory(path.join(projectPath, ".dart_tool"));
+        final root = base.resolve(pkg["rootUri"] as String).toFilePath();
+        return path.join(root, "darwin");
+      }
+    }
+    return null;
+  }
+
   Future<void> zipDirectoryPosix(Directory source, File dest) async {
     final encoder = ZipFileEncoder();
     encoder.create(dest.path);
@@ -537,8 +747,8 @@ class PackageCommand extends Command {
   Future<int> runPython(List<String> args,
       {Map<String, String>? environment}) async {
     if (_pythonDir == null) {
-      _pythonDir = Directory(
-          path.join(_buildDir!.path, "build_python_$buildPythonVersion"));
+      _pythonDir = Directory(path.join(
+          _buildDir!.path, "build_python_${_release.standaloneVersion}"));
 
       if (!await _pythonDir!.exists()) {
         await _pythonDir!.create();
@@ -555,30 +765,41 @@ class PackageCommand extends Command {
         } else if (Platform.isLinux && isArm64) {
           arch = 'aarch64-unknown-linux-gnu';
         } else if (Platform.isWindows) {
-          arch = 'x86_64-pc-windows-msvc-shared';
+          // python-build-standalone dropped the explicit `-shared` MSVC
+          // variant; the remaining install_only_stripped build is shared.
+          arch = 'x86_64-pc-windows-msvc';
         }
 
         var pythonArchiveFilename =
-            "cpython-$buildPythonVersion+$buildPythonReleaseDate-$arch-install_only_stripped.tar.gz";
+            "cpython-${_release.standaloneVersion}+${_release.standaloneReleaseDate}-$arch-install_only_stripped.tar.gz";
 
+        // Cache CPython by release date: the same tarball is reused across
+        // every example/project until `_release.standaloneReleaseDate` bumps.
+        var pythonCacheDir = Directory(path.join(_fletCacheRoot(),
+            'python-build-standalone', _release.standaloneReleaseDate));
+        await pythonCacheDir.create(recursive: true);
         var pythonArchivePath =
-            path.join(_buildDir!.path, pythonArchiveFilename);
+            path.join(pythonCacheDir.path, pythonArchiveFilename);
 
         if (!await File(pythonArchivePath).exists()) {
           // download Python distr from GitHub
           final url =
-              "https://github.com/astral-sh/python-build-standalone/releases/download/$buildPythonReleaseDate/$pythonArchiveFilename";
+              "https://github.com/astral-sh/python-build-standalone/releases/download/${_release.standaloneReleaseDate}/$pythonArchiveFilename";
 
           if (_verbose) {
             verbose(
                 "Downloading Python distributive from $url to $pythonArchivePath");
           } else {
             stdout.writeln(
-                "Downloading Python distributive from $url to a build directory");
+                "Downloading Python distributive from $url to $pythonArchivePath");
           }
 
+          // Write to a .tmp sibling first so a Ctrl-C / network blip doesn't
+          // poison the cache with a truncated archive on the next run.
+          var tmpPath = "$pythonArchivePath.tmp";
           var response = await http.get(Uri.parse(url));
-          await File(pythonArchivePath).writeAsBytes(response.bodyBytes);
+          await File(tmpPath).writeAsBytes(response.bodyBytes);
+          await File(tmpPath).rename(pythonArchivePath);
         }
 
         // extract Python from archive
@@ -592,6 +813,8 @@ class PackageCommand extends Command {
         await Process.run(
             'tar', ['-xzf', pythonArchivePath, '-C', _pythonDir!.path]);
 
+        stdout.writeln("Python distributive extracted to ${_pythonDir!.path}");
+
         if (Platform.isMacOS) {
           duplicateSysconfigFile(_pythonDir!.path);
         }
@@ -602,8 +825,9 @@ class PackageCommand extends Command {
         ? path.join(_pythonDir!.path, 'python', 'python.exe')
         : path.join(_pythonDir!.path, 'python', 'bin', 'python3');
 
-    // Run the python executable
-    verbose([pythonExePath, ...args].join(" "));
+    // Always log the Python command so a silent pip install (typical during
+    // `pip install git+…` while git is cloning) doesn't look like a hang.
+    stdout.writeln("Running: ${[pythonExePath, ...args].join(" ")}");
     return await runExec(pythonExePath, args, environment: environment);
   }
 
@@ -634,7 +858,7 @@ class PackageCommand extends Command {
     const htmlFooter = "</body></html>\n";
 
     var pyodidePackages =
-        await fetchJsonFromUrl("$pyodideRootUrl/$pyodideLockFile");
+        await fetchJsonFromUrl("$_pyodideRootUrl/$pyodideLockFile");
 
     var wheels = Map.from(pyodidePackages["packages"])
       ..removeWhere((k, p) => !p["file_name"].endsWith(".whl"));
@@ -656,7 +880,7 @@ class PackageCommand extends Command {
         wheels.forEach((k, p) {
           if (k == parts[1].toLowerCase()) {
             links.add(
-                "<a href=\"$pyodideRootUrl/${p['file_name']}#sha256=${p['sha256']}\">${p['file_name']}</a></br>");
+                "<a href=\"$_pyodideRootUrl/${p['file_name']}#sha256=${p['sha256']}\">${p['file_name']}</a></br>");
           }
         });
         return Response.ok(htmlHeader + links.join("\n") + htmlFooter,

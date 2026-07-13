@@ -5,6 +5,11 @@ import android.content.ContextWrapper;
 import androidx.annotation.NonNull;
 import android.system.Os;
 import android.content.Intent;
+import android.os.Handler;
+import android.os.Looper;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
 import io.flutter.embedding.engine.plugins.activity.ActivityAware;
@@ -16,21 +21,39 @@ import io.flutter.plugin.common.MethodChannel.Result;
 
 import com.flet.serious_python_android.PythonActivity;
 
-/** AndroidPlugin */
+/**
+ * Thin Flutter plugin: surfaces nativeLibraryDir and app version to Dart and
+ * exposes a few process-wide env vars Python code may read. All Python
+ * lifecycle now lives in libdart_bridge.so (downloaded from
+ * flet-dev/dart-bridge), invoked from Dart via FFI.
+ */
 public class AndroidPlugin implements FlutterPlugin, MethodCallHandler, ActivityAware {
 
   public static final String MAIN_ACTIVITY_HOST_CLASS_NAME = "MAIN_ACTIVITY_HOST_CLASS_NAME";
   public static final String MAIN_ACTIVITY_CLASS_NAME = "MAIN_ACTIVITY_CLASS_NAME";
   public static final String ANDROID_NATIVE_LIBRARY_DIR = "ANDROID_NATIVE_LIBRARY_DIR";
 
-  /// The MethodChannel that will the communication between Flutter and native
-  /// Android
-  ///
-  /// This local reference serves to register the plugin with the Flutter Engine
-  /// and unregister it
-  /// when the Flutter Engine is detached from the Activity
   private MethodChannel channel;
   private Context context;
+
+  // Heavy native work (asset extraction/unzipping, native library loading) must
+  // NOT run on the platform main thread: it would block Android's Choreographer
+  // and starve Flutter's vsync, freezing on-screen animations (e.g. the boot
+  // spinner). Run it on a background executor and post the MethodChannel result
+  // back on the main thread (Flutter requires result callbacks there).
+  private final ExecutorService ioExecutor = Executors.newSingleThreadExecutor();
+  private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+  private void runAsync(@NonNull Result result, String errorCode, Callable<Object> work) {
+    ioExecutor.execute(() -> {
+      try {
+        Object value = work.call();
+        mainHandler.post(() -> result.success(value));
+      } catch (Throwable e) {
+        mainHandler.post(() -> result.error(errorCode, e.getMessage(), null));
+      }
+    });
+  }
 
   @Override
   public void onAttachedToEngine(@NonNull FlutterPluginBinding flutterPluginBinding) {
@@ -39,10 +62,45 @@ public class AndroidPlugin implements FlutterPlugin, MethodCallHandler, Activity
     channel.setMethodCallHandler(this);
     this.context = flutterPluginBinding.getApplicationContext();
     try {
-      Os.setenv(ANDROID_NATIVE_LIBRARY_DIR, new ContextWrapper(this.context).getApplicationInfo().nativeLibraryDir, true);
+      android.content.pm.ApplicationInfo ai =
+          new ContextWrapper(this.context).getApplicationInfo();
+      Os.setenv(ANDROID_NATIVE_LIBRARY_DIR, ai.nativeLibraryDir, true);
+      // Under modern packaging (useLegacyPackaging=false) native libs are NOT extracted
+      // to nativeLibraryDir; they live uncompressed/page-aligned inside the APK and are
+      // loadable via Bionic's zip-path (apk!/lib/<abi>/<soname>). Export that prefix so
+      // the finder can dlopen them directly from the APK (mmap, no extraction). For Play
+      // Store AAB installs the libs are in a per-ABI config split, not base.apk, so pick
+      // whichever installed APK actually contains lib/<abi>/.
+      String abi = (android.os.Build.SUPPORTED_ABIS != null
+          && android.os.Build.SUPPORTED_ABIS.length > 0)
+          ? android.os.Build.SUPPORTED_ABIS[0] : "";
+      Os.setenv("ANDROID_APK_NATIVE_PREFIX", apkNativePrefix(ai, abi), true);
     } catch (Exception e) {
       // nothing to do
     }
+  }
+
+  // Bionic zip-path prefix (<apk>!/lib/<abi>/) of the installed APK that holds the
+  // native libs. Single-APK builds -> base.apk; Play Store AAB installs -> the
+  // per-ABI config split (base.apk has no libs then). Detected by probing for the
+  // always-present libdart_bridge.so.
+  private static String apkNativePrefix(android.content.pm.ApplicationInfo ai, String abi) {
+    java.util.List<String> apks = new java.util.ArrayList<>();
+    if (ai.sourceDir != null) apks.add(ai.sourceDir);
+    if (ai.splitSourceDirs != null) {
+      java.util.Collections.addAll(apks, ai.splitSourceDirs);
+    }
+    String member = "lib/" + abi + "/libdart_bridge.so";
+    for (String apk : apks) {
+      try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(apk)) {
+        if (zf.getEntry(member) != null) {
+          return apk + "!/lib/" + abi + "/";
+        }
+      } catch (Exception e) {
+        // unreadable apk — skip
+      }
+    }
+    return (ai.sourceDir != null ? ai.sourceDir : "") + "!/lib/" + abi + "/";
   }
 
   @Override
@@ -58,39 +116,89 @@ public class AndroidPlugin implements FlutterPlugin, MethodCallHandler, Activity
 
   @Override
   public void onMethodCall(@NonNull MethodCall call, @NonNull Result result) {
-    if (call.method.equals("getPlatformVersion")) {
-      result.success("Android " + android.os.Build.VERSION.RELEASE);
-    } else if (call.method.equals("getAppVersion")) {
+    if (call.method.equals("getAppVersion")) {
       try {
         String packageName = context.getPackageName();
         android.content.pm.PackageManager pm = context.getPackageManager();
         android.content.pm.PackageInfo info = pm.getPackageInfo(packageName, 0);
         String versionName = info.versionName;
-        long versionCode = info.getLongVersionCode();
+        // PackageInfo.getLongVersionCode() is API 28+. Calling it unconditionally
+        // makes the Android Gradle plugin (R8) outline the call into a synthetic
+        // class that it may merge with other API 28+ outlines (e.g. Flutter's
+        // ImageDecoder-based image decoder). Invoking that merged class on
+        // API < 28 fails verification with NoClassDefFoundError and crashes the
+        // app on launch, because getAppVersion runs on every startup. Guard the
+        // call so older devices use the deprecated int field instead.
+        long versionCode = (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P)
+            ? info.getLongVersionCode()
+            : (long) info.versionCode;
         result.success(versionName + "+" + versionCode);
       } catch (Exception e) {
         result.error("Error", e.getMessage(), null);
       }
-    } else if (call.method.equals("getNativeLibraryDir")) {
-      ContextWrapper contextWrapper = new ContextWrapper(context);
-      String nativeLibraryDir = contextWrapper.getApplicationInfo().nativeLibraryDir;
-      result.success(nativeLibraryDir);
     } else if (call.method.equals("loadLibrary")) {
-      try {
-        System.loadLibrary(call.argument("libname"));
-        result.success(null);
-      } catch (Throwable e) {
-        result.error("Error", e.getMessage(), null);
-      }
-    } else if (call.method.equals("setEnvironmentVariable")) {
-      String name = call.argument("name");
-      String value = call.argument("value");
-      try {
-        Os.setenv(name, value, true);
-        result.success(null);
-      } catch (Exception e) {
-        result.error("Error", e.getMessage(), null);
-      }
+      // Load a native library by name via Java's System.loadLibrary(), which —
+      // unlike dart:ffi's dlopen-based DynamicLibrary.open used for
+      // libdart_bridge — runs the library's JNI_OnLoad. That's how pyjnius's
+      // helper (libpyjni.so) captures the JavaVM + app ClassLoader.
+      //
+      // Run off the main thread (dlopen + JNI_OnLoad can be slow). System.loadLibrary
+      // resolves the .so via the calling class's loader (AndroidPlugin -> app loader)
+      // regardless of thread, and JNI_OnLoad's FindClass uses that same loader; we
+      // also pin the worker's context loader to the app loader so JNI_OnLoad sees it
+      // if it reads the thread context loader.
+      final String libname = call.argument("libname");
+      runAsync(result, "loadLibrary", () -> {
+        Thread t = Thread.currentThread();
+        ClassLoader prev = t.getContextClassLoader();
+        t.setContextClassLoader(context.getClassLoader());
+        try {
+          System.loadLibrary(libname);
+        } finally {
+          t.setContextClassLoader(prev);
+        }
+        return null;
+      });
+    } else if (call.method.equals("extractAsset")) {
+      // Stream an APK asset to disk as one whole file (e.g. stdlib.zip).
+      final String asset = call.argument("asset");
+      final String dest = call.argument("dest");
+      runAsync(result, "extractAsset", () -> {
+        java.io.File destFile = new java.io.File(dest);
+        if (destFile.getParentFile() != null) destFile.getParentFile().mkdirs();
+        byte[] buf = new byte[1 << 16];
+        try (java.io.InputStream in = context.getAssets().open(asset);
+             java.io.OutputStream out = new java.io.FileOutputStream(destFile)) {
+          int n;
+          while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        }
+        return dest;
+      });
+    } else if (call.method.equals("unzipAsset")) {
+      // Unpack an APK asset zip (e.g. extract.zip) into a directory tree.
+      final String asset = call.argument("asset");
+      final String destDir = call.argument("dest");
+      runAsync(result, "unzipAsset", () -> {
+        java.io.File root = new java.io.File(destDir);
+        byte[] buf = new byte[1 << 16];
+        try (java.io.InputStream in = context.getAssets().open(asset);
+             java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(in)) {
+          java.util.zip.ZipEntry e;
+          while ((e = zis.getNextEntry()) != null) {
+            java.io.File f = new java.io.File(root, e.getName());
+            if (e.isDirectory()) {
+              f.mkdirs();
+            } else {
+              if (f.getParentFile() != null) f.getParentFile().mkdirs();
+              try (java.io.OutputStream out = new java.io.FileOutputStream(f)) {
+                int n;
+                while ((n = zis.read(buf)) > 0) out.write(buf, 0, n);
+              }
+            }
+          }
+        }
+        return destDir;
+      });
     } else {
       result.notImplemented();
     }
@@ -99,6 +207,7 @@ public class AndroidPlugin implements FlutterPlugin, MethodCallHandler, Activity
   @Override
   public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
     channel.setMethodCallHandler(null);
+    ioExecutor.shutdown();
   }
 
   @Override

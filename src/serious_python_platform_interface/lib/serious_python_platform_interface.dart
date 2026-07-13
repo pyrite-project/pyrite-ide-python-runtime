@@ -2,6 +2,7 @@ import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 import 'src/method_channel_serious_python.dart';
 
+export 'src/dart_bridge_ffi.dart';
 export 'src/utils.dart';
 
 abstract class SeriousPythonPlatform extends PlatformInterface {
@@ -25,8 +26,15 @@ abstract class SeriousPythonPlatform extends PlatformInterface {
     _instance = instance;
   }
 
-  Future<String?> getPlatformVersion() {
-    throw UnimplementedError('platformVersion() has not been implemented.');
+  /// Materializes the packaged app on disk (if needed) and returns the
+  /// directory that contains its entry point (`main.pyc` / `main.py`).
+  ///
+  /// On desktop/iOS the app ships unpacked inside the application bundle, so
+  /// this is a pure path lookup. On Android the app ships as a stored
+  /// `app.zip` asset inside the APK and is unpacked once (version-keyed) to a
+  /// writable files-dir location on the first launch after an install/update.
+  Future<String> prepareApp() {
+    throw UnimplementedError('prepareApp() has not been implemented.');
   }
 
   Future<String?> run(String appPath,

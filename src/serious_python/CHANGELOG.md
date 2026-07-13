@@ -1,3 +1,90 @@
+## 4.3.2
+
+* Bump the bundled python-build snapshot to `20260712`, fixing two on-device startup crashes affecting Python **3.13/3.14** apps (3.12 is unaffected). Bundled Python versions (**3.12.13 / 3.13.14 / 3.14.6**) and `dart_bridge` (**1.5.0**) are unchanged from 4.3.1.
+* **Android:** fix 3.13/3.14 apps crashing with `SIGSYS` before any app code runs on x86_64 (and other ABIs with a 32-bit-style `SYS_open`) — mimalloc's raw `open(2)` syscall is forbidden by Android's seccomp policy. See `serious_python_android` 4.3.2.
+* **iOS/Android:** `_pyrepl` is no longer pruned from the mobile stdlib — Python 3.14's `pdb` imports it at module load, so anything importing `pdb` (e.g. pytest's debugging plugin) failed with `ModuleNotFoundError: No module named '_pyrepl'`. See `serious_python_darwin` / `serious_python_android` 4.3.2.
+
+## 4.3.1
+
+* **Android:** fix `flet build apk --arch x86_64` (or any `--arch` subset not including `arm64-v8a`) producing an APK with an **empty `sitepackages.zip`** — the app shipped without its Python dependencies and the first import failed at startup. See `serious_python_android` 4.3.1.
+
+## 4.3.0
+
+* **Desktop multiprocessing support** ([flet-dev/flet#4283](https://github.com/flet-dev/flet/issues/4283)). `dart_bridge` **1.5.0** adds `serious_python_is_mp_invocation` / `serious_python_main` (+ `_w` wide-char variants on Windows): host apps call them first thing in `main` to detect CPython child command lines (`--multiprocessing-fork`, `-c "from multiprocessing..."` — spawn workers, the resource tracker, and the forkserver) and service them as a plain headless interpreter (`Py_Main`/`Py_BytesMain`, stable ABI) instead of re-launching the GUI. The exports rely on the `PYTHONHOME`/`PYTHONPATH` the parent already stamped process-wide.
+* `PYTHONINSPECT=1` is no longer set by any platform implementation. It had no effect on the embedded interpreter, but it leaked into the process environment where any *real* interpreter child (e.g. a serviced multiprocessing worker) would inherit it and hang in interactive mode after its command completed.
+* Bump the bundled python-build snapshot to `20260708`, which delivers `dart_bridge` **1.5.0**; Pyodide for 3.14 bumped **314.0.1 → 314.0.2**. Bundled Python versions are unchanged from 4.2.1 (**3.12.13 / 3.13.14 / 3.14.6**).
+* **Windows:** fix `flet build windows` failing with `file INSTALL cannot find "C:/WINDOWS/System32/vcruntime140_1.dll"` for users who build with VS Build Tools rather than full Visual Studio (a WOW64 file-system-redirection issue with the bundled 32-bit cmake). See `serious_python_windows` 4.3.0.
+
+## 4.2.1
+
+* **iOS/macOS:** ctypes packages that ship plain `.dylib` shared libraries (e.g. `llama-cpp-python`'s `libllama` / `libggml`) now load on the **iOS simulator**. Such `.dylib`s are now packaged as per-slice xcframeworks (previously only `.so` C-extensions were), so they carry a simulator slice instead of shipping the device build and failing `dlopen` with `incompatible platform (have 'iOS', need 'iOS-simulator')`; their install-name is preserved so multi-lib packages still resolve their sibling libs. See `serious_python_darwin` 4.2.1.
+* **iOS:** the `_multiprocessing` extension is now built into the runtime (importable, not spawnable) via `flet-dev/python-build` `20260701`. Bundled Python versions are unchanged from 4.2.0 (**3.12.13 / 3.13.14 / 3.14.6**).
+
+## 4.2.0
+
+* **Android:** `armeabi-v7a` (32-bit ARM) is now bundled for Python **3.13** and **3.14**, not just 3.12 — `flet-dev/python-build` `20260630` publishes 32-bit ARM runtimes for those minors (built with `dart_bridge` **1.4.1**). The `package` command's hardcoded "3.12-only" `armeabi-v7a` skip is replaced by a manifest-driven check against each minor's `PythonRelease.androidAbis`, so the wheel fan-out (and the Android plugin's `abiFilters`) follow whatever python-build publishes per minor.
+* Bundle **3.12.13 / 3.13.14 / 3.14.6** (python-build `20260630`; CPython-standalone `20260623`); Pyodide **0.27.7 / 0.29.4 / 314.0.1** (3.14 bumped 314.0.0 → 314.0.1).
+
+## 4.1.1
+
+* **Android:** fix two startup crashes — apps crashing on launch on Android 8.1 and below (API < 28) due to an unguarded `getLongVersionCode()` call, and the interpreter failing to start on a non-primary ABI (e.g. an x86_64 emulator) with `ModuleNotFoundError: No module named '_sysconfigdata__android_<arch>-linux-android'`. See `serious_python_android` 4.1.1.
+
+## 4.1.0
+
+* **Android:** run first-launch asset unpacking and native library loading off the platform main thread so they no longer block vsync — boot-time animations (e.g. a splash / boot screen spinner) stay smooth while the app starts. Also ship consumer ProGuard rules that keep the pyjnius bootstrap classes, fixing pyjnius in release (minified) Android builds. See `serious_python_android` 4.1.0.
+
+## 4.0.0
+
+* **App packaging lifted into serious_python.** Your Python app now ships **unpacked inside the application bundle**, next to the Python stdlib and site-packages, on macOS / iOS / Windows / Linux — no first-launch `app.zip` extraction. On **Android** the app ships as a *stored* `app.zip` asset inside the APK and is unpacked once (version-keyed) to the app-support files dir on the first launch after an install/update, like the existing `extract.zip`. Web (Pyodide) is unchanged. The `package` command stages the processed app into **`SERIOUS_PYTHON_APP`** (symmetric with `SERIOUS_PYTHON_SITE_PACKAGES`); each platform's native build copies it into the bundle (Android zips it as a stored asset).
+* **New `SeriousPython.prepareApp()`** — materializes the app (Android first-launch unpack) and returns the directory containing its entry point. **`SeriousPython.run()` now takes no `assetPath` argument** (it resolves the app via `prepareApp()`), sets the current directory to a writable per-app data dir (`<application-support>/data`) — not the read-only bundle — so relative file writes / SQLite work, and runs `main.pyc`/`main.py` (or `appFileName`).
+* **Breaking change:** the `app.zip` asset convention and the runtime zip-extraction API are removed — `SeriousPython.run("app/app.zip")`, `extractAssetZip`, and `extractFileZip` no longer exist. Repackage with `dart run serious_python:main package <app> -p <platform>` and call `SeriousPython.run()` with no arguments.
+* **Android:** the runtime payload moved to `<application-support>/flet/{app, stdlib.zip, sitepackages.zip, extract/}` (resolved via `getApplicationSupportDirectory()`; the custom `getFilesDir` method channel is dropped). User data in the sibling `<application-support>/data` survives app updates.
+* **Swift Package Manager (darwin) staging in the `package` command — on by default.** For iOS/macOS the `package` command runs the host-side equivalent of the podspec `prepare_command` (which SPM has no hook for) by resolving `serious_python_darwin`'s `darwin/` dir (`SERIOUS_PYTHON_DARWIN_DIR` override, else the project's `package_config.json`), invoking `prepare_spm.sh`, and writing the `SP_NATIVE_SET` cache-bust key to `build/.serious_python_spm_key` (overridable via `SERIOUS_PYTHON_SPM_KEY_FILE`) for the caller to export into the `flutter build` environment. SPM is Flutter's default darwin integration since 3.44, so this happens by default — set **`SERIOUS_PYTHON_DARWIN_SPM`** to a falsy value (`0`/`false`/`no`/`off`) to opt out and build with CocoaPods (the podspec stages then). See `serious_python_darwin` 4.0.0.
+
+## 3.0.0
+
+* **New in-process transport (dart_bridge FFI).** `SeriousPython.run` can now run the embedded interpreter **in-process** through the `dart_bridge` FFI bridge instead of talking to it over a socket. The Python lifecycle (initialize / run / teardown) is absorbed into the `dart_bridge` native library on every platform — `dart_bridge.xcframework` (iOS/macOS), `libdart_bridge.so` (Android/Linux), and `dart_bridge.dll` / `dart_bridge.pyd` (Windows) — and a new `PythonBridge` API exposes a MsgPack control channel plus dedicated binary data channels between Dart and Python. See the `bridge_example` app. The bundled `dart_bridge` is **1.4.0**.
+* **Android native packaging — memory-mapped from the APK.** Python extension modules are relocated into `jniLibs` and loaded **directly from the APK** (mmap, no extraction) by a custom importer that resolves them from `.soref` markers; pure Python ships in stored, ABI-common asset zips read via `zipimport` (no per-ABI duplication). Apps no longer need `useLegacyPackaging` / `keepDebugSymbols` — the brittle per-app packaging config is gone. Set **`SERIOUS_PYTHON_ANDROID_EXTRACT_PACKAGES`** (comma-separated relative paths) to ship path-hungry packages extracted to disk. The dart-bridge Android binary uses the full CPython API (`PyConfig`) to install the importer before `site` runs.
+* **Breaking change:** requires Flutter **3.44.2** / Dart 3.12+. The Android plugin moves to AGP **8.11.1**, `compileSdk` **36**, Java **17**, and the Kotlin-DSL Gradle build (`build.gradle.kts`).
+* Python runtime versions are now a committed snapshot of `flet-dev/python-build`'s date-keyed `manifest.json`, generated by `dart run serious_python:gen_version_tables`. **`SERIOUS_PYTHON_VERSION`** (short, e.g. `3.14`) is the single input — the full CPython version, python-build release date, Pyodide version + platform tag, and `dart_bridge` version all derive from it. `SERIOUS_PYTHON_FULL_VERSION`, `SERIOUS_PYTHON_BUILD_DATE`, and `DART_BRIDGE_VERSION` remain as rarely-needed escape hatches. The native build configs (Android `build.gradle`, Darwin podspec, Linux/Windows `CMakeLists.txt`) read the generated `python_versions.properties`, and a CI job fails if the snapshots drift from the manifest. This replaces the per-config hardcoded defaults and the `flet build`-exported `SERIOUS_PYTHON_FULL_VERSION` / `SERIOUS_PYTHON_BUILD_DATE` introduced in 2.0.0.
+* Bundle **3.12.13 / 3.13.14 / 3.14.6** (python-build `20260614`); Pyodide **0.27.7 / 0.29.4 / 314.0.0** (314.0.0 GA, up from the 314.0.0a2 in 2.0.0).
+* Add **`dart run serious_python:main version [--json]`** — prints the serious_python version, the pinned python-build release, and the supported Python / Pyodide / dart_bridge matrix.
+* The embedded Darwin runtime re-extracts when the selected Python version changes (a version marker guards `dist_ios` / `dist_macos`), so a clean build after switching `--python-version` can't mix C-extension ABIs (`bad magic number` / `unknown slot ID`).
+* Cache downloaded Python distributions and `dart_bridge` artifacts under `$FLET_CACHE_DIR` (default `~/.flet/cache`) across all platforms.
+* Remove the scaffold `getPlatformVersion` method from the platform plugins.
+* Drop the `x86` (32-bit Intel) Android ABI — Flutter no longer produces it. Android builds target `arm64-v8a` + `x86_64` (plus `armeabi-v7a` on Python 3.12); the `x86` wheel platform-tag entry and the Android packaging rules referencing it are removed.
+* Android ABI list now reads from python-build's manifest (per-minor `android_abis`, surfaced as `<short>.android_abis` in `python_versions.properties` and `PythonRelease.androidAbis` in the generated Dart) instead of the hardcoded `if pythonVersion == "3.12"` branch in `serious_python_android/android/build.gradle.kts`. Drives both `defaultConfig.ndk.abiFilters` and the per-ABI download/copy fan-out; adding a future minor only needs the one-line manifest edit.
+* **Breaking change:** the `configure` command (and the bare in-place version-switching machinery, including `stageDarwinRuntime`) is removed. Switching the bundled Python version between builds is now handled by a clean rebuild — `flet build` wipes its build dir on a version change, and the Darwin `dist_ios` / `dist_macos` version marker re-extracts the runtime — so a separate `serious_python configure` step is no longer needed.
+* **Bug fix:** the Pyodide 0.29 wheel platform tag for the 3.13 row was `pyodide-2025.0-wasm32`, but Pyodide publishes 0.29 wheels under `pyemscripten_2025_0_wasm32`; corrected to `pyemscripten-2025.0-wasm32` so `flet build web --python-version 3.13` matches native wheels.
+
+## 2.0.0
+
+* **Breaking change:** the `package` command's default Python is now the latest supported stable (3.14), up from the previously implicit 3.12. Scripts that ran `dart run serious_python:main package …` without `--python-version` will now download CPython 3.14, install 3.14 wheels, and use the matching Pyodide / Android platform tags. Pin explicitly with `--python-version 3.12` (or `SERIOUS_PYTHON_VERSION=3.12`) to preserve the old behavior.
+* **Breaking change:** Android `sysconfig.get_platform()` tag format changed from `android-24-arm64-v8a` to `android-24-arm64_v8a` (and similarly for `armeabi-v7a`). The emitted wheel tag (`android_24_arm64_v8a`) is unchanged, but anything reading the raw `sysconfig.get_platform()` string from `sitecustomize.py` should switch separators.
+* **Breaking change:** Windows host arch identifier dropped the `-shared` suffix (`x86_64-pc-windows-msvc-shared` → `x86_64-pc-windows-msvc`); follows astral-sh/python-build-standalone, which only publishes the combined (already shared) `install_only_stripped` build.
+* Multi-version Python support. The `package` command accepts `--python-version` (or `SERIOUS_PYTHON_VERSION` env var) to select between Python 3.12 / 3.13 / 3.14. The matching CPython-standalone build, Pyodide release, and Emscripten wheel platform tag are looked up from a new `_pythonReleases` table. Adding a future pre-release line (e.g. 3.15 beta) is a one-row append with `prerelease: true`; the Flet CLI uses that flag to keep open-ended `requires-python` specifiers (`>=3.14`) on stable, while still letting `--python-version 3.15` or `==3.15.*` opt in.
+* The Emscripten pip platform tag is now derived per Python release (e.g. `pyodide-2024.0-wasm32` for 0.27.7, `pyemscripten-2026.0-wasm32` for 314.0.0a2), via a `pyodide_platform_tag` field in the version registry. The previous static `pyodide-2024.0-wasm32` entry in `platforms["Emscripten"]` has been removed.
+* `sitecustomize.py` now shims `platform.android_ver` so the new pip / packaging that ships with python-build-standalone 20260602+ can compute Android wheel tags on Python 3.12 hosts (where `android_ver` didn't exist) and on Python 3.13+ hosts (where it returns `api_level=0` off-device).
+* Skip 32-bit Android ABIs (`armeabi-v7a`, `x86`) when Python ≥ 3.13 — PEP 738 dropped 32-bit Android support, and `flet-dev/python-build` no longer publishes those runtimes for those versions.
+
+## 1.0.1
+
+### Improvements
+
+* Cache downloaded Python distribution tarballs (`python-android-dart-<py>-<abi>.tar.gz`) across builds. The `downloadDistArchive_*` Gradle tasks now write to a persistent cache directory — `$FLET_CACHE_DIR/python-build/v<python_version>/` if the env var is set, otherwise `~/.flet/cache/python-build/v<python_version>/` — and use `onlyIfModified true` + `useETag "all"` so subsequent builds issue a conditional GET (`If-None-Match` / `If-Modified-Since`) against `objects.githubusercontent.com` instead of re-downloading 30–100 MB per ABI per build. When the upstream release republishes a tarball at the same URL (e.g. a Python patch update under the existing `v<py>` release), the validators flip and the cache refreshes automatically; otherwise the build skips the download entirely. `tempAndMove true` guards against partial downloads being kept in the cache ([flet-dev/flet#6555](https://github.com/flet-dev/flet/discussions/6555), [#208](https://github.com/flet-dev/serious-python/pull/208)) by @FeodorFitsner.
+
+### Bug fixes
+
+* Set `PIP_REQUIRE_VIRTUALENV=false` for `pip install` in the `package` command so packaging works in environments where users have globally exported `PIP_REQUIRE_VIRTUALENV=true` ([#202](https://github.com/flet-dev/serious-python/pull/202), [#204](https://github.com/flet-dev/serious-python/pull/204)) by @FeodorFitsner.
+
+## 1.0.0
+
+* **Breaking change:** `--platform` argument value `Pyodide` has been renamed to `Emscripten` to match what `platform.system()` returns in the Pyodide runtime, so PEP 508 markers like `platform_system != 'Emscripten'` work consistently.
+
+## 0.9.12
+
+* Fix web packaging to skip `site-packages` when appropriate ([#199](https://github.com/flet-dev/serious-python/pull/199)).
+
 ## 0.9.11
 
 * Disable user-site packages in pip environment ([#195](https://github.com/flet-dev/serious-python/pull/195)).

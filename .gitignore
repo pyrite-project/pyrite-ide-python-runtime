@@ -36,4 +36,14 @@ dist/
 # Python
 .venv/
 __pypackages__/
+*.so
+*.pyd
+*.dylib
+*.dll
+*.egg-info/
+*.egg/
+
+# FVM
+.fvm/
+
 src/serious_python_android/android/src/main/site-packages/

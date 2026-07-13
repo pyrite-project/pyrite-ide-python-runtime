@@ -1,23 +1,34 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:path/path.dart' as p;
 import 'package:serious_python_platform_interface/serious_python_platform_interface.dart';
 
-/// An implementation of [SeriousPythonPlatform] that uses method channels.
+/// iOS / macOS implementation of [SeriousPythonPlatform].
+///
+/// Python lifecycle (env, sys.path, Py_Initialize, run, finalize, sync/async)
+/// lives in `serious_python_run`, statically linked into the host app via
+/// dart_bridge.xcframework. This class just resolves the python.bundle
+/// resource path from the Swift plugin and dispatches a single FFI call.
 class SeriousPythonDarwin extends SeriousPythonPlatform {
-  /// The method channel used to interact with the native platform.
   @visibleForTesting
   final methodChannel = const MethodChannel('serious_python');
 
-  /// Registers this class as the default instance of [SeriousPythonPlatform]
   static void registerWith() {
     SeriousPythonPlatform.instance = SeriousPythonDarwin();
   }
 
+  /// The app ships unpacked inside the `python.bundle` resource at
+  /// `<resourcePath>/app` (placed by the darwin podspec `resource_bundles`,
+  /// next to `stdlib` + `site-packages`).
   @override
-  Future<String?> getPlatformVersion() async {
-    final version =
-        await methodChannel.invokeMethod<String>('getPlatformVersion');
-    return version;
+  Future<String> prepareApp() async {
+    final resourcePath =
+        await methodChannel.invokeMethod<String>('getResourcePath');
+    if (resourcePath == null) {
+      throw StateError(
+          'serious_python: failed to resolve plugin resource path');
+    }
+    return p.join(resourcePath, 'app');
   }
 
   @override
@@ -26,13 +37,48 @@ class SeriousPythonDarwin extends SeriousPythonPlatform {
       List<String>? modulePaths,
       Map<String, String>? environmentVariables,
       bool? sync}) async {
-    final Map<String, dynamic> arguments = {
-      'appPath': appPath,
-      'script': script,
-      'modulePaths': modulePaths,
-      'environmentVariables': environmentVariables,
-      'sync': sync
+    final resourcePath =
+        await methodChannel.invokeMethod<String>('getResourcePath');
+    if (resourcePath == null) {
+      throw StateError(
+          'serious_python: failed to resolve plugin resource path');
+    }
+
+    final appDir = p.dirname(appPath);
+    final pythonPaths = <String>[
+      ...?modulePaths,
+      appDir,
+      p.join(appDir, '__pypackages__'),
+      p.join(resourcePath, 'site-packages'),
+      p.join(resourcePath, 'stdlib'),
+      p.join(resourcePath, 'stdlib', 'lib-dynload'),
+    ];
+
+    final env = <String, String>{
+      'PYTHONDONTWRITEBYTECODE': '1',
+      'PYTHONNOUSERSITE': '1',
+      'PYTHONUNBUFFERED': '1',
+      'LC_CTYPE': 'UTF-8',
+      'PYTHONHOME': resourcePath,
+      'PYTHONPATH': pythonPaths.join(':'),
+      ...?environmentVariables,
     };
-    return await methodChannel.invokeMethod<String>('runPython', arguments);
+
+    final hasScript = script != null && script.isNotEmpty;
+    final rc = await runPersistentPython(
+      bridge: DartBridge.instance,
+      appPath: hasScript ? null : appPath,
+      script: hasScript ? script : null,
+      modulePaths: pythonPaths,
+      environmentVariables: env,
+      sync: sync ?? false,
+    );
+
+    // sync=true: rc is the Python exit code. sync=false: rc is the spawn
+    // result (0 = worker thread started successfully).
+    if (rc != 0) {
+      return 'Python exited with code $rc';
+    }
+    return null;
   }
 }

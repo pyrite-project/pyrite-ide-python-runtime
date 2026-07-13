@@ -1,6 +1,8 @@
 import 'dart:io';
 
+import 'package:flutter/widgets.dart';
 import 'package:path/path.dart' as path;
+import 'package:path_provider/path_provider.dart';
 import 'package:serious_python_platform_interface/serious_python_platform_interface.dart';
 
 export 'package:serious_python_platform_interface/src/utils.dart';
@@ -9,35 +11,42 @@ export 'package:serious_python_platform_interface/src/utils.dart';
 class SeriousPython {
   SeriousPython._();
 
-  /// Returns the current name and version of the operating system.
-  static Future<String?> getPlatformVersion() {
-    return SeriousPythonPlatform.instance.getPlatformVersion();
+  /// Prepares the packaged app on disk and returns its directory.
+  static Future<String> prepareApp() {
+    WidgetsFlutterBinding.ensureInitialized();
+    return SeriousPythonPlatform.instance.prepareApp();
   }
 
-  /// Runs Python program from an asset.
+  /// Runs the packaged Python app.
   ///
-  /// [assetPath] is the path to an asset which is a zip archive
-  /// with a Python program. When the app starts the archive is unpacked
-  /// to a temporary directory and Serious Python plugin will try to run
-  /// `main.py` in the root of the archive. Current directory is changed to
-  /// a temporary directory.
+  /// The app is resolved via [prepareApp] and runs with a writable per-app
+  /// data directory as its current directory.
+  static Future<String?> run(
+      {String? appFileName,
+      List<String>? modulePaths,
+      Map<String, String>? environmentVariables,
+      bool? sync}) async {
+    final appDir = await prepareApp();
+    final appPath = await _resolveEntryPoint(appDir, appFileName);
+
+    final supportDir = await getApplicationSupportDirectory();
+    final dataDir = Directory(path.join(supportDir.path, 'data'));
+    if (!await dataDir.exists()) {
+      await dataDir.create(recursive: true);
+    }
+    Directory.current = dataDir.path;
+
+    return runProgram(appPath,
+        modulePaths: modulePaths,
+        environmentVariables: environmentVariables,
+        sync: sync);
+  }
+
+  /// Runs a Python program from a Flutter asset.
   ///
-  /// If a Python app has a different entry point
-  /// it could be specified with [appFileName] parameter.
-  ///
-  /// Environment variables that must be available to a Python program could
-  /// be passed in [environmentVariables].
-  ///
-  /// By default, Serious Python expects Python dependencies installed into
-  /// `__pypackages__` directory in the root of app directory. Additional paths
-  /// to look for 3rd-party packages can be specified with [modulePaths] parameter.
-  ///
-  /// Set [sync] to `true` to sychronously run Python program; otherwise the
-  /// program starts in a new thread.
-  ///
-  /// [targetPath], [checkHash], and [invalidateKey] control the extraction
-  /// cache used for zip assets.
-  static Future<String?> run(String assetPath,
+  /// Zip assets are extracted on demand. [targetPath], [checkHash], and
+  /// [invalidateKey] control the extraction cache.
+  static Future<String?> runAsset(String assetPath,
       {String? appFileName,
       List<String>? modulePaths,
       Map<String, String>? environmentVariables,
@@ -45,62 +54,36 @@ class SeriousPython {
       String? targetPath,
       bool checkHash = false,
       String? invalidateKey}) async {
-    // unpack app from asset
-    String appPath = "";
-    if (path.extension(assetPath) == ".zip") {
-      appPath = await extractAssetZip(assetPath,
+    late String appPath;
+    if (path.extension(assetPath) == '.zip') {
+      final appDir = await extractAssetZip(assetPath,
           targetPath: targetPath,
           checkHash: checkHash,
           invalidateKey: invalidateKey);
-      if (appFileName != null) {
-        appPath = path.join(appPath, appFileName);
-      } else if (await File(path.join(appPath, "main.pyc")).exists()) {
-        appPath = path.join(appPath, "main.pyc");
-      } else if (await File(path.join(appPath, "main.py")).exists()) {
-        appPath = path.join(appPath, "main.py");
-      } else {
-        throw Exception(
-            "App archive must contain either `main.py` or `main.pyc`; otherwise `appFileName` must be specified.");
-      }
+      appPath = await _resolveEntryPoint(appDir, appFileName);
     } else {
       appPath = await extractAsset(assetPath);
     }
 
-    // set current directory to app path
     Directory.current = path.dirname(appPath);
-
-    // run python program
     return runProgram(appPath,
         modulePaths: modulePaths,
         environmentVariables: environmentVariables,
-        script: Platform.isWindows ? "" : null,
         sync: sync);
   }
 
-  /// Runs Python program from a path.
+  /// Runs a Python program from a path.
   ///
-  /// This is low-level method.
-  /// Make sure `Directory.current` is set before calling this method.
-  ///
-  /// [appPath] is the full path to a .py or .pyc file to run.
-  ///
-  /// Environment variables that must be available to a Python program could
-  /// be passed in [environmentVariables].
-  ///
-  /// By default, Serious Python expects Python dependencies installed into
-  /// `__pypackages__` directory in the root of app directory. Additional paths
-  /// to look for 3rd-party packages can be specified with [modulePaths] parameter.
-  ///
-  /// Set [sync] to `true` to sychronously run Python program; otherwise the
-  /// program starts in a new thread.
+  /// [script] executes source text instead of [appPath]. An empty script is
+  /// treated as the pre-4.0 Windows sentinel for path mode.
   static Future<String?> runProgram(String appPath,
       {String? script,
       List<String>? modulePaths,
       Map<String, String>? environmentVariables,
       bool? sync}) async {
-    // run python program
+    final normalizedScript = script != null && script.isEmpty ? null : script;
     return SeriousPythonPlatform.instance.run(appPath,
-        script: script,
+        script: normalizedScript,
         modulePaths: modulePaths,
         environmentVariables: environmentVariables,
         sync: sync);
@@ -108,5 +91,20 @@ class SeriousPython {
 
   static void terminate() {
     SeriousPythonPlatform.instance.terminate();
+  }
+
+  static Future<String> _resolveEntryPoint(
+      String appDir, String? appFileName) async {
+    if (appFileName != null) {
+      return path.join(appDir, appFileName);
+    }
+    if (await File(path.join(appDir, 'main.pyc')).exists()) {
+      return path.join(appDir, 'main.pyc');
+    }
+    if (await File(path.join(appDir, 'main.py')).exists()) {
+      return path.join(appDir, 'main.py');
+    }
+    throw Exception('App must contain either `main.py` or `main.pyc`; '
+        'otherwise `appFileName` must be specified.');
   }
 }

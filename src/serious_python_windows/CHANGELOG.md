@@ -1,3 +1,68 @@
+## 4.3.2
+
+* Bump the bundled python-build snapshot to `20260712`; aligns with the `serious_python_*` 4.3.2 release. The release contains only Android/iOS runtime fixes — no Windows-affecting changes.
+
+## 4.3.1
+
+* Version bump aligning with the `serious_python_*` 4.3.1 release.
+
+## 4.3.0
+
+* Bump `dart_bridge` to **1.5.0** (python-build snapshot `20260708`): multiprocessing child-interception exports, including the Windows wide-char variants `serious_python_is_mp_invocation_w` / `serious_python_main_w` (→ `Py_Main`) consumed by the flet build template's `wWinMain`. See the `serious_python` 4.3.0 notes.
+* `PYTHONINSPECT=1` is no longer set by any platform implementation. It had no effect on the embedded interpreter, but it leaked into the process environment where any *real* interpreter child (e.g. a serviced multiprocessing worker) would inherit it and hang in interactive mode after its command completed.
+* **Fix `flet build windows` failing with `file INSTALL cannot find "C:/WINDOWS/System32/vcruntime140_1.dll"`** for users who have VS Build Tools installed rather than full Visual Studio. The plugin harvests the CRT runtime DLLs (`msvcp140.dll` / `vcruntime140.dll` / `vcruntime140_1.dll`) from `%WINDIR%\System32`, but Flutter drives the CMake install step with the **32-bit** `cmake.exe` bundled in VS Build Tools. Under WOW64 file-system redirection that process sees `System32` transparently rewritten to `SysWOW64`, which holds the x86 CRT and doesn't contain `vcruntime140_1.dll` at all — so the x64 build copied wrong-arch DLLs and then failed. The CRT directory is now resolved via the `Sysnative` pseudo-folder (visible only to 32-bit processes, mapping back to the real 64-bit `System32`) when present, falling back to `System32` for native 64-bit cmake. See flet-dev/flet#6436.
+
+## 4.2.1
+
+* Bump the bundled python-build snapshot to `20260701`; aligns with the `serious_python_*` 4.2.1 release. The Windows runtimes are byte-identical to `20260630` (the release only rebuilds the iOS runtime).
+
+## 4.2.0
+
+* Bump the bundled python-build snapshot to `20260630` (`dart_bridge` `1.4.1`); aligns with the `serious_python_*` 4.2.0 release.
+
+## 4.1.1
+
+* Version bump aligning with the `serious_python_*` 4.1.1 release.
+
+## 4.1.0
+
+* Version bump aligning with the `serious_python_*` 4.1.0 release.
+
+## 4.0.0
+
+* `prepareApp()` returns `<exeDir>/app`; the app's Python sources ship unpacked next to the bundled CPython `Lib`/`DLLs`/`site-packages` (no first-launch extraction). The CMakeLists copies `SERIOUS_PYTHON_APP` into the runner output.
+* Version bump aligning with the `serious_python_*` 4.0.0 release.
+
+## 3.0.0
+
+* **In-process Python (dart_bridge FFI).** The Python lifecycle is absorbed into `dart_bridge.dll` / `dart_bridge.pyd` (from `flet-dev/dart-bridge` **1.4.0**) instead of a socket transport; both Release and Debug `dart_bridge.pyd` ship so 3.13/3.14 Debug builds resolve too.
+* **Breaking change:** requires Flutter **3.44.2**.
+* `CMakeLists.txt` resolves the Python version from the generated `python_versions.properties` (a snapshot of python-build's `manifest.json`): `SERIOUS_PYTHON_VERSION` selects the version; the full version and build date derive from the table, with `SERIOUS_PYTHON_FULL_VERSION` / `SERIOUS_PYTHON_BUILD_DATE` left as escape hatches. Downloads continue to use python-build's date-keyed release scheme.
+* Remove the scaffold `getPlatformVersion` method.
+
+## 2.0.0
+
+* **Breaking change:** default bundled Python version is now 3.14 (was 3.12). The plugin downloads `python-windows-for-dart-3.14.zip` and bundles `python314.dll` / `python314.lib` unless `SERIOUS_PYTHON_VERSION=3.12` is set in the build environment.
+* Multi-version Python support. `PYTHON_VERSION` in `windows/CMakeLists.txt` reads from `SERIOUS_PYTHON_VERSION`; the `python-build` download URL and the `python312.lib` / `python312.dll` filenames are derived from it (e.g. `python313.lib`, `python314.dll`).
+
+## 1.0.1
+
+### Improvements
+
+* Cache downloaded Python distribution tarballs (`python-android-dart-<py>-<abi>.tar.gz`) across builds. The `downloadDistArchive_*` Gradle tasks now write to a persistent cache directory — `$FLET_CACHE_DIR/python-build/v<python_version>/` if the env var is set, otherwise `~/.flet/cache/python-build/v<python_version>/` — and use `onlyIfModified true` + `useETag "all"` so subsequent builds issue a conditional GET (`If-None-Match` / `If-Modified-Since`) against `objects.githubusercontent.com` instead of re-downloading 30–100 MB per ABI per build. When the upstream release republishes a tarball at the same URL (e.g. a Python patch update under the existing `v<py>` release), the validators flip and the cache refreshes automatically; otherwise the build skips the download entirely. `tempAndMove true` guards against partial downloads being kept in the cache ([flet-dev/flet#6555](https://github.com/flet-dev/flet/discussions/6555), [#208](https://github.com/flet-dev/serious-python/pull/208)) by @FeodorFitsner.
+
+### Bug fixes
+
+* Set `PIP_REQUIRE_VIRTUALENV=false` for `pip install` in the `package` command so packaging works in environments where users have globally exported `PIP_REQUIRE_VIRTUALENV=true` ([#202](https://github.com/flet-dev/serious-python/pull/202), [#204](https://github.com/flet-dev/serious-python/pull/204)) by @FeodorFitsner.
+
+## 1.0.0
+
+* **Breaking change:** `--platform` argument value `Pyodide` has been renamed to `Emscripten` to match what `platform.system()` returns in the Pyodide runtime, so PEP 508 markers like `platform_system != 'Emscripten'` work consistently.
+
+## 0.9.12
+
+* Fix web packaging to skip `site-packages` when appropriate ([#199](https://github.com/flet-dev/serious-python/pull/199)).
+
 ## 0.9.11
 
 * Disable user-site packages in pip environment ([#195](https://github.com/flet-dev/serious-python/pull/195)).

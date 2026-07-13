@@ -8,21 +8,124 @@ cmake_minimum_required(VERSION 3.10)
 
 # Project-level configuration.
 set(PROJECT_NAME "serious_python_linux")
-set(PYTHON_VERSION "3.12")
+# Python runtime versions come from the generated python_versions.properties
+# (a snapshot of python-build's manifest.json — see serious_python's
+# gen_version_tables). SERIOUS_PYTHON_VERSION selects the version; the rest
+# derive from the table. The per-field env vars are escape hatches.
+set(_PV_FILE "${CMAKE_CURRENT_LIST_DIR}/python_versions.properties")
+function(pv_get key out)
+  string(REPLACE "." "\\." _re "${key}")
+  file(STRINGS "${_PV_FILE}" _m REGEX "^${_re}=")
+  if(_m)
+    string(REGEX REPLACE "^[^=]*=" "" _v "${_m}")
+    set(${out} "${_v}" PARENT_SCOPE)
+  else()
+    set(${out} "" PARENT_SCOPE)
+  endif()
+endfunction()
+
+if(DEFINED ENV{SERIOUS_PYTHON_VERSION})
+  set(PYTHON_VERSION "$ENV{SERIOUS_PYTHON_VERSION}")
+else()
+  pv_get("default_python_version" PYTHON_VERSION)
+endif()
+if(DEFINED ENV{SERIOUS_PYTHON_FULL_VERSION})
+  set(PYTHON_FULL_VERSION "$ENV{SERIOUS_PYTHON_FULL_VERSION}")
+else()
+  pv_get("${PYTHON_VERSION}.full_version" PYTHON_FULL_VERSION)
+endif()
+if(DEFINED ENV{SERIOUS_PYTHON_BUILD_DATE})
+  set(PYTHON_BUILD_DATE "$ENV{SERIOUS_PYTHON_BUILD_DATE}")
+else()
+  pv_get("python_build_release_date" PYTHON_BUILD_DATE)
+endif()
 set(PYTHON_ARCH ${CMAKE_HOST_SYSTEM_PROCESSOR})
+if(DEFINED ENV{DART_BRIDGE_VERSION})
+  set(DART_BRIDGE_VERSION "$ENV{DART_BRIDGE_VERSION}")
+else()
+  pv_get("dart_bridge_version" DART_BRIDGE_VERSION)
+endif()
+if(PYTHON_FULL_VERSION STREQUAL "")
+  message(FATAL_ERROR "serious_python: unknown SERIOUS_PYTHON_VERSION '${PYTHON_VERSION}'")
+endif()
+
+# Cross-plugin download cache. FLET_CACHE_DIR is the same env var used by the
+# Android gradle task, the Darwin prepare_*.sh scripts, and Windows
+# CMakeLists; defaulting to ~/.flet/cache keeps a single shared location.
+if(DEFINED ENV{FLET_CACHE_DIR})
+  set(FLET_CACHE_DIR "$ENV{FLET_CACHE_DIR}")
+else()
+  set(FLET_CACHE_DIR "$ENV{HOME}/.flet/cache")
+endif()
+# Date-keyed so a same-version re-release (new build date) re-downloads instead
+# of being served stale from a previous release's cache. dart-bridge stays
+# version-keyed (its re-releases bump the version).
+set(PB_CACHE "${FLET_CACHE_DIR}/python-build/v${PYTHON_FULL_VERSION}-${PYTHON_BUILD_DATE}")
+set(DB_CACHE "${FLET_CACHE_DIR}/dart-bridge/v${DART_BRIDGE_VERSION}")
+file(MAKE_DIRECTORY "${PB_CACHE}" "${DB_CACHE}")
+
 project(${PROJECT_NAME} LANGUAGES CXX)
 
 # This value is used when generating builds using this plugin, so it must
 # not be changed.
 set(PLUGIN_NAME "serious_python_linux_plugin")
 
+function(_sp_download url dest)
+  if(EXISTS "${dest}")
+    return()
+  endif()
+  message(STATUS "Downloading: ${url}")
+  # .tmp + rename so a Ctrl-C / network blip doesn't poison the cache.
+  file(DOWNLOAD "${url}" "${dest}.tmp" STATUS _dl_status SHOW_PROGRESS)
+  list(GET _dl_status 0 _dl_code)
+  list(GET _dl_status 1 _dl_message)
+  if(NOT _dl_code EQUAL 0)
+    file(REMOVE "${dest}.tmp")
+    message(FATAL_ERROR "Failed to download ${url}: ${_dl_message}")
+  endif()
+  file(RENAME "${dest}.tmp" "${dest}")
+endfunction()
+
+# ---- python-linux-dart tarball (libpython + stdlib) -----------------------
+# Tarball lives in the shared cache; extraction targets the per-plugin build
+# tree so a `flutter clean` doesn't force a re-download.
 set(PYTHON_PACKAGE ${CMAKE_BINARY_DIR}/python)
-set(PYTHON_URL https://github.com/flet-dev/python-build/releases/download/v${PYTHON_VERSION}/python-linux-dart-${PYTHON_VERSION}-${PYTHON_ARCH}.tar.gz)
-set(PYTHON_FILE ${CMAKE_BINARY_DIR}/python-linux-dart-${PYTHON_VERSION}-${PYTHON_ARCH}.tar.gz)
-if (NOT EXISTS ${PYTHON_FILE})
-  file(DOWNLOAD ${PYTHON_URL} ${PYTHON_FILE})
-  file(ARCHIVE_EXTRACT INPUT ${PYTHON_FILE} DESTINATION ${CMAKE_BINARY_DIR}/python)
+set(PYTHON_URL https://github.com/flet-dev/python-build/releases/download/${PYTHON_BUILD_DATE}/python-linux-dart-${PYTHON_FULL_VERSION}-${PYTHON_ARCH}.tar.gz)
+set(PYTHON_FILE "${PB_CACHE}/python-linux-dart-${PYTHON_FULL_VERSION}-${PYTHON_ARCH}.tar.gz")
+_sp_download("${PYTHON_URL}" "${PYTHON_FILE}")
+# Re-extract when the tree is missing OR was unpacked for a different
+# version/release (a marker keyed to version + build date), so a same-version
+# re-release replaces it instead of being skipped.
+set(_py_build_id "${PYTHON_FULL_VERSION}-${PYTHON_BUILD_DATE}")
+set(_py_marker "${PYTHON_PACKAGE}/.python_build_id")
+set(_py_extract TRUE)
+if(EXISTS "${_py_marker}")
+  file(READ "${_py_marker}" _py_cur)
+  string(STRIP "${_py_cur}" _py_cur)
+  if(_py_cur STREQUAL "${_py_build_id}")
+    set(_py_extract FALSE)
+  endif()
 endif()
+if(_py_extract)
+  file(REMOVE_RECURSE "${PYTHON_PACKAGE}")
+  file(ARCHIVE_EXTRACT INPUT "${PYTHON_FILE}" DESTINATION "${PYTHON_PACKAGE}")
+  file(WRITE "${_py_marker}" "${_py_build_id}")
+endif()
+
+# ---- dart_bridge prebuilt .so ---------------------------------------------
+# abi3-linked against libpython3.so (the runtime linker finds libpython3.so
+# next to the consuming app's exe; the python-linux-dart tarball above
+# provides it). Cached under its arch-qualified name so multiple arches can
+# co-exist in $FLET_CACHE_DIR; copied to a stable `libdart_bridge.so` in the
+# build tree so Flutter's bundled_libraries machinery (and the Dart side's
+# DynamicLibrary.open("libdart_bridge.so")) finds a deterministic name.
+set(DART_BRIDGE_CACHED "${DB_CACHE}/libdart_bridge-linux-${PYTHON_ARCH}.so")
+_sp_download(
+  "https://github.com/flet-dev/dart-bridge/releases/download/v${DART_BRIDGE_VERSION}/libdart_bridge-linux-${PYTHON_ARCH}.so"
+  "${DART_BRIDGE_CACHED}")
+set(DART_BRIDGE_SO "${CMAKE_BINARY_DIR}/dart_bridge/libdart_bridge.so")
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/dart_bridge")
+configure_file("${DART_BRIDGE_CACHED}" "${DART_BRIDGE_SO}" COPYONLY)
 
 # Any new source files that you add to the plugin should be added here.
 list(APPEND PLUGIN_SOURCES
@@ -52,30 +155,43 @@ target_compile_definitions(${PLUGIN_NAME} PRIVATE FLUTTER_PLUGIN_IMPL)
 target_include_directories(${PLUGIN_NAME} INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
-include_directories(
-  "${PYTHON_PACKAGE}/include/python3.12"
-)
 
 target_link_libraries(${PLUGIN_NAME} PRIVATE flutter)
 target_link_libraries(${PLUGIN_NAME} PRIVATE PkgConfig::GTK)
-target_link_libraries(${PLUGIN_NAME} PRIVATE
-  "${PYTHON_PACKAGE}/lib/libpython3.so"
-)
 
 # List of absolute paths to libraries that should be bundled with the plugin.
-# This list could contain prebuilt libraries, or libraries created by an
-# external build triggered from this build file.
+# Includes libdart_bridge.so (downloaded above) so Flutter copies it into the
+# runner's lib/ dir; libpython3.so + libpython<ver>.so.1.0 from the python-
+# linux-dart tarball so dart_bridge's DT_NEEDED libpython3.so resolves at
+# runtime to the abi3 stub which forwards to the version-specific lib.
 set(serious_python_linux_bundled_libraries
+  "${DART_BRIDGE_SO}"
   "${PYTHON_PACKAGE}/lib/libpython3.so"
-  "${PYTHON_PACKAGE}/lib/libpython3.12.so.1.0"
+  "${PYTHON_PACKAGE}/lib/libpython${PYTHON_VERSION}.so.1.0"
   PARENT_SCOPE
 )
 
-install(DIRECTORY "${PYTHON_PACKAGE}/lib/python3.12"
+install(DIRECTORY "${PYTHON_PACKAGE}/lib/python${PYTHON_VERSION}"
   DESTINATION "${CMAKE_BINARY_DIR}/bundle")
 
-install(CODE "
-  file(REMOVE_RECURSE \"${CMAKE_BINARY_DIR}/bundle/site-packages\")
-  file(MAKE_DIRECTORY \"${CMAKE_BINARY_DIR}/bundle/site-packages\")
-  file(COPY \"$ENV{SERIOUS_PYTHON_SITE_PACKAGES}/\" DESTINATION \"${CMAKE_BINARY_DIR}/bundle/site-packages\")
-")
+# Mirror an external site-packages dir into the bundle if the env var is set
+# AND points at an existing directory. The env var may be set workflow-wide
+# while specific jobs don't actually create the directory.
+if(DEFINED ENV{SERIOUS_PYTHON_SITE_PACKAGES} AND EXISTS "$ENV{SERIOUS_PYTHON_SITE_PACKAGES}")
+  install(CODE "
+    file(REMOVE_RECURSE \"${CMAKE_BINARY_DIR}/bundle/site-packages\")
+    file(MAKE_DIRECTORY \"${CMAKE_BINARY_DIR}/bundle/site-packages\")
+    file(COPY \"$ENV{SERIOUS_PYTHON_SITE_PACKAGES}/\" DESTINATION \"${CMAKE_BINARY_DIR}/bundle/site-packages\")
+  ")
+endif()
+
+# The app's Python sources (staged unpacked by serious_python's `package`
+# command) are bundled as a bare `app/` dir next to the stdlib + site-packages;
+# the runtime adds `<exeDir>/app` to sys.path (no extraction at launch).
+if(DEFINED ENV{SERIOUS_PYTHON_APP} AND EXISTS "$ENV{SERIOUS_PYTHON_APP}")
+  install(CODE "
+    file(REMOVE_RECURSE \"${CMAKE_BINARY_DIR}/bundle/app\")
+    file(MAKE_DIRECTORY \"${CMAKE_BINARY_DIR}/bundle/app\")
+    file(COPY \"$ENV{SERIOUS_PYTHON_APP}/\" DESTINATION \"${CMAKE_BINARY_DIR}/bundle/app\")
+  ")
+endif()

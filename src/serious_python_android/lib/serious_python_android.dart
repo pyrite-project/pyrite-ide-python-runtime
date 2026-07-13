@@ -1,32 +1,78 @@
-import 'dart:async';
 import 'dart:io';
 
-import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:serious_python_platform_interface/serious_python_platform_interface.dart';
 
-import 'src/cpython.dart';
-import 'src/log.dart';
-
-/// An implementation of [SeriousPythonPlatform] that uses method channels.
+/// Android implementation of [SeriousPythonPlatform].
 class SeriousPythonAndroid extends SeriousPythonPlatform {
-  /// The method channel used to interact with the native platform.
   @visibleForTesting
   final methodChannel = const MethodChannel('android_plugin');
 
-  /// Registers this class as the default instance of [SeriousPythonPlatform]
   static void registerWith() {
     SeriousPythonPlatform.instance = SeriousPythonAndroid();
   }
 
+  Future<String> _base() async {
+    final support = await getApplicationSupportDirectory();
+    return p.join(support.path, 'flet');
+  }
+
+  Future<String> _runtimeKey() async {
+    final appVersion = await _appVersion();
+    return appVersion != null ? 'runtime:$appVersion' : 'runtime:dev';
+  }
+
+  /// Materializes the interpreter assets without requiring a packaged app.
+  ///
+  /// Pyrite executes boot and plugin files from runtime-extracted assets, so
+  /// it needs stdlib/site-packages even when SERIOUS_PYTHON_APP was not set
+  /// and the APK intentionally has no app.zip.
+  Future<void> _prepareRuntime() async {
+    final base = await _base();
+    final stdlibZip = p.join(base, 'stdlib.zip');
+    final siteZip = p.join(base, 'sitepackages.zip');
+    final extractDir = p.join(base, 'extract');
+    final key = await _runtimeKey();
+    final marker = File(p.join(base, '.runtime-key'));
+    final upToDate =
+        await marker.exists() && (await marker.readAsString()) == key;
+    if (upToDate) return;
+
+    await Directory(base).create(recursive: true);
+    if (await Directory(extractDir).exists()) {
+      await Directory(extractDir).delete(recursive: true);
+    }
+    await methodChannel.invokeMethod(
+        'extractAsset', {'asset': 'stdlib.zip', 'dest': stdlibZip});
+    await methodChannel.invokeMethod(
+        'extractAsset', {'asset': 'sitepackages.zip', 'dest': siteZip});
+    await methodChannel.invokeMethod(
+        'unzipAsset', {'asset': 'extract.zip', 'dest': extractDir});
+    await marker.writeAsString(key);
+  }
+
   @override
-  Future<String?> getPlatformVersion() async {
-    final version =
-        await methodChannel.invokeMethod<String>('getPlatformVersion');
-    return version;
+  Future<String> prepareApp() async {
+    await _prepareRuntime();
+
+    final base = await _base();
+    final appDir = p.join(base, 'app');
+    final key = await _runtimeKey();
+    final marker = File(p.join(base, '.app-key'));
+    final upToDate =
+        await marker.exists() && (await marker.readAsString()) == key;
+    if (!upToDate) {
+      if (await Directory(appDir).exists()) {
+        await Directory(appDir).delete(recursive: true);
+      }
+      await methodChannel
+          .invokeMethod('unzipAsset', {'asset': 'app.zip', 'dest': appDir});
+      await marker.writeAsString(key);
+    }
+    return appDir;
   }
 
   @override
@@ -35,101 +81,57 @@ class SeriousPythonAndroid extends SeriousPythonPlatform {
       List<String>? modulePaths,
       Map<String, String>? environmentVariables,
       bool? sync}) async {
-    Future<void> setenv(String key, String value) =>
-        methodChannel.invokeMethod<String>(
-            'setEnvironmentVariable', {'name': key, 'value': value});
+    await _prepareRuntime();
 
-    // load libpyjni.so to get JNI reference
-    try {
-      await methodChannel
-          .invokeMethod<String>('loadLibrary', {'libname': 'pyjni'});
-      await setenv("FLET_JNI_READY", "1");
-    } catch (e) {
-      spDebug("Unable to load libpyjni.so library: $e");
-    }
+    final base = await _base();
+    final stdlibZip = p.join(base, 'stdlib.zip');
+    final siteZip = p.join(base, 'sitepackages.zip');
+    final extractDir = p.join(base, 'extract');
+    final programDir = p.dirname(appPath);
 
-    const pythonSharedLib = "libpython3.12.so";
-
-    String? getPythonFullVersion() {
-      try {
-        final cpython = getCPython(pythonSharedLib);
-        final versionPtr = cpython.Py_GetVersion();
-        return versionPtr.cast<Utf8>().toDartString();
-      } catch (e) {
-        spDebug("Unable to read Python version for invalidation: $e");
-        return null;
-      }
-    }
-
-    Future<String?> getAppVersion() async {
-      try {
-        return await methodChannel.invokeMethod<String>('getAppVersion');
-      } catch (e) {
-        spDebug("Unable to get app version for invalidation: $e");
-        return null;
-      }
-    }
-
-    // unpack python bundle
-    final nativeLibraryDir =
-        await methodChannel.invokeMethod<String>('getNativeLibraryDir');
-    spDebug("getNativeLibraryDir: $nativeLibraryDir");
-
-    var bundlePath = "$nativeLibraryDir/libpythonbundle.so";
-    var sitePackagesZipPath = "$nativeLibraryDir/libpythonsitepackages.so";
-
-    if (!await File(bundlePath).exists()) {
-      throw Exception("Python bundle not found: $bundlePath");
-    }
-    final pythonVersion = getPythonFullVersion();
-    spDebug("Python version: $pythonVersion");
-    final pythonInvalidateKey = pythonVersion != null
-        ? "python:$pythonVersion"
-        : "python:$pythonSharedLib";
-    var pythonLibPath = await extractFileZip(bundlePath,
-        targetPath: "python_bundle", invalidateKey: pythonInvalidateKey);
-    spDebug("pythonLibPath: $pythonLibPath");
-
-    var programDirPath = p.dirname(appPath);
-
-    var moduleSearchPaths = [
-      programDirPath,
+    final pythonPaths = <String>[
       ...?modulePaths,
-      "$pythonLibPath/modules",
-      "$pythonLibPath/stdlib"
+      programDir,
+      extractDir,
+      siteZip,
+      stdlibZip,
     ];
 
-    if (await File(sitePackagesZipPath).exists()) {
-      final appVersion = await getAppVersion();
-      spDebug("App version: $appVersion");
-      final sitePackagesInvalidateKey =
-          appVersion != null ? "app:$appVersion" : null;
-      var sitePackagesPath = await extractFileZip(sitePackagesZipPath,
-          targetPath: "python_site_packages",
-          invalidateKey: sitePackagesInvalidateKey);
-      spDebug("sitePackagesPath: $sitePackagesPath");
-      moduleSearchPaths.add(sitePackagesPath);
+    var jniReady = false;
+    try {
+      await methodChannel.invokeMethod('loadLibrary', {'libname': 'pyjni'});
+      jniReady = true;
+    } catch (_) {
+      // pyjnius is optional.
     }
 
-    await setenv("PYTHONINSPECT", "1");
-    await setenv("PYTHONDONTWRITEBYTECODE", "1");
-    await setenv("PYTHONNOUSERSITE", "1");
-    await setenv("PYTHONUNBUFFERED", "1");
-    await setenv("LC_CTYPE", "UTF-8");
-    await setenv("PYTHONHOME", pythonLibPath);
-    await setenv("PYTHONPATH", moduleSearchPaths.join(":"));
+    final env = <String, String>{
+      'PYTHONDONTWRITEBYTECODE': '1',
+      'PYTHONNOUSERSITE': '1',
+      'PYTHONUNBUFFERED': '1',
+      'LC_CTYPE': 'UTF-8',
+      'PYTHONHOME': base,
+      'PYTHONPATH': pythonPaths.join(':'),
+      if (jniReady) 'FLET_JNI_READY': '1',
+      ...?environmentVariables,
+    };
 
-    // set environment variables
+    final rc = await runPersistentPython(
+      bridge: DartBridge.instance,
+      appPath: script == null || script.isEmpty ? appPath : null,
+      script: script == null || script.isEmpty ? null : script,
+      modulePaths: pythonPaths,
+      environmentVariables: env,
+      sync: sync ?? false,
+    );
+    return rc != 0 ? 'Python exited with code $rc' : null;
+  }
 
-    updateEnvironmentVariables(environmentVariables);
-
-    if (environmentVariables != null) {
-      for (var v in environmentVariables.entries) {
-        await setenv(v.key, v.value);
-      }
+  Future<String?> _appVersion() async {
+    try {
+      return await methodChannel.invokeMethod<String>('getAppVersion');
+    } catch (_) {
+      return null;
     }
-
-    return runPythonProgramFFI(
-        sync ?? false, pythonSharedLib, appPath, script ?? "");
   }
 }
