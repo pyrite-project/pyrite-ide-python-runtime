@@ -1,3 +1,7 @@
+## Unreleased
+
+* Always load the release `dart_bridge.dll` on Windows so Flutter Debug builds use a CPython ABI compatible with standard native extension wheels.
+
 ## 4.3.2
 
 * Version bump aligning with the `serious_python_*` 4.3.2 release.

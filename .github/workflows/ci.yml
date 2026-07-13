@@ -369,7 +369,11 @@ jobs:
         working-directory: "src/serious_python/example/bridge_example"
         shell: bash
         run: |
-          dart run serious_python:main package app/src --platform Windows --python-version ${{ matrix.python_version }}
+          dart run serious_python:main package app/src \
+            --platform Windows \
+            --python-version ${{ matrix.python_version }} \
+            --requirements=-r \
+            --requirements=app/src/requirements.txt
           # bash + pipefail so the test step actually fails when flutter fails
           # (default PowerShell shell on windows runners eats the failure when
           # piping into tail).

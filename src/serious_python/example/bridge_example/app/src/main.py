@@ -27,6 +27,14 @@ import tracemalloc
 
 import dart_bridge
 
+if sys.platform == "win32":
+    import pydantic_core as _pydantic_core
+
+    print(
+        f"[bridge_example] pydantic_core={_pydantic_core.__version__}",
+        flush=True,
+    )
+
 CONTROL_PORT_ENV = "BRIDGE_EXAMPLE_CONTROL_PORT"
 ECHO_PORT_ENV = "BRIDGE_EXAMPLE_ECHO_PORT"
 

@@ -7,9 +7,9 @@ import 'package:serious_python_platform_interface/serious_python_platform_interf
 ///
 /// Python lifecycle (env, sys.path, Py_Initialize, run, finalize, sync/async)
 /// lives in `serious_python_run`, packaged as `dart_bridge.dll` (Release CRT)
-/// or `dart_bridge_d.dll` (Debug CRT) and bundled next to the .exe by this
-/// plugin's CMakeLists.txt. The correct DLL is picked at runtime based on
-/// [kDebugMode].
+/// and bundled next to the .exe by this plugin's CMakeLists.txt. Flutter Debug
+/// builds intentionally use the release CPython ABI so standard native wheels
+/// from PyPI remain loadable.
 ///
 /// This class derives PYTHONHOME from `Platform.resolvedExecutable` (the
 /// runner .exe directory, where the bundled CPython lives) and dispatches a

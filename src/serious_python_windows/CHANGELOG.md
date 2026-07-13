@@ -1,3 +1,7 @@
+## Unreleased
+
+* Use the release CPython and `dart_bridge` ABI in every Windows Flutter build mode, including Debug, so standard native extension wheels from PyPI can be imported.
+
 ## 4.3.2
 
 * Bump the bundled python-build snapshot to `20260712`; aligns with the `serious_python_*` 4.3.2 release. The release contains only Android/iOS runtime fixes — no Windows-affecting changes.
