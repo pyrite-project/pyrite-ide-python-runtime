@@ -93,6 +93,15 @@ class SeriousPython {
     SeriousPythonPlatform.instance.terminate();
   }
 
+  /// Resets plugin-added modules, paths, and managed launch variables while
+  /// keeping the process-wide CPython interpreter alive.
+  static Future<void> resetRuntime() async {
+    final rc = await resetPersistentPython(bridge: DartBridge.instance);
+    if (rc != 0) {
+      throw StateError('Could not reset persistent Python runtime (code $rc)');
+    }
+  }
+
   static Future<String> _resolveEntryPoint(
       String appDir, String? appFileName) async {
     if (appFileName != null) {

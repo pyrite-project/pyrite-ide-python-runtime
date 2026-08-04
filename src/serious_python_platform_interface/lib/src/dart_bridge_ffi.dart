@@ -3,9 +3,12 @@ import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io' show Platform;
 import 'dart:isolate';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
+
+import 'persistent_runtime_completion_registry.dart';
 
 /// FFI bindings for the `dart_bridge` C library published by
 /// [flet-dev/dart-bridge](https://github.com/flet-dev/dart-bridge).
@@ -131,6 +134,19 @@ class DartBridge {
 
   static DartBridge? _instance;
 
+  /// Reserved entry included in every native session-restart signal.
+  static const dartSessionTokenLabel = '__serious_python_dart_session__';
+
+  static final int dartSessionToken = _createDartSessionToken();
+
+  static int _createDartSessionToken() {
+    final random = Random.secure();
+    final high = random.nextInt(1 << 31);
+    final low = random.nextInt(1 << 31);
+    final token = (high << 31) | low;
+    return token == 0 ? 1 : token;
+  }
+
   /// Default per-platform loader. Cached after the first call.
   static DartBridge get instance => _instance ??= DartBridge._(_loadDefault());
 
@@ -210,16 +226,20 @@ class DartBridge {
   void signalDartSession(Map<String, int> portMap) {
     final f = _signalDartSession;
     if (f == null || portMap.isEmpty) return;
+    final sessionPorts = {
+      ...portMap,
+      dartSessionTokenLabel: dartSessionToken,
+    };
     using((Arena arena) {
-      final labels = arena<Pointer<Utf8>>(portMap.length);
-      final ports = arena<Int64>(portMap.length);
+      final labels = arena<Pointer<Utf8>>(sessionPorts.length);
+      final ports = arena<Int64>(sessionPorts.length);
       var i = 0;
-      for (final entry in portMap.entries) {
+      for (final entry in sessionPorts.entries) {
         labels[i] = entry.key.toNativeUtf8(allocator: arena);
         ports[i] = entry.value;
         i++;
       }
-      f(portMap.length, labels, ports);
+      f(sessionPorts.length, labels, ports);
     });
   }
 }
@@ -337,10 +357,31 @@ Future<int> runPersistentPython({
   );
 }
 
+/// Restores the shared interpreter to the snapshot captured by the runtime
+/// bootstrap without finalizing CPython.
+Future<int> resetPersistentPython({required DartBridge bridge}) {
+  final runtime = _persistentRuntime;
+  if (runtime == null) return Future<int>.value(0);
+  if (!identical(runtime.bridge, bridge)) {
+    throw StateError('Persistent Python runtime is using another bridge');
+  }
+  return runtime.reset();
+}
+
 _PersistentPythonRuntime? _persistentRuntime;
 
+int _runtimeEpochCounter = 0;
+
+String _newRuntimeEpoch(int port) {
+  final counter = _runtimeEpochCounter++;
+  return '${DateTime.now().microsecondsSinceEpoch}-$port-$counter';
+}
+
 class _PersistentPythonRuntime {
-  _PersistentPythonRuntime(this.bridge) {
+  _PersistentPythonRuntime(this.bridge, {String? runtimeEpoch}) {
+    _completionRegistry = PersistentRuntimeCompletionRegistry(
+      runtimeEpoch ?? _newRuntimeEpoch(_port),
+    );
     bridge.initDartApiDL();
     _receivePort.listen(_onMessage);
   }
@@ -349,11 +390,12 @@ class _PersistentPythonRuntime {
 
   final DartBridge bridge;
   final ReceivePort _receivePort = ReceivePort();
-  final Map<int, Completer<int>> _completions = {};
+  late final PersistentRuntimeCompletionRegistry _completionRegistry;
   Future<void>? _startFuture;
   int _nextCommandId = 1;
 
   int get _port => _receivePort.sendPort.nativePort;
+  String get _runtimeEpoch => _completionRegistry.epoch;
 
   Future<int> run({
     String? appPath,
@@ -363,16 +405,16 @@ class _PersistentPythonRuntime {
     Map<String, String>? environmentVariables,
     required bool sync,
   }) async {
-    await (_startFuture ??= _start(
+    await _ensureStarted(
       modulePaths: modulePaths,
       environmentVariables: environmentVariables,
-    ));
+    );
 
     final id = _nextCommandId++;
     Completer<int>? completer;
     if (sync) {
       completer = Completer<int>();
-      _completions[id] = completer;
+      _completionRegistry.register(id, completer);
     }
 
     final command = <String, Object?>{
@@ -388,13 +430,54 @@ class _PersistentPythonRuntime {
 
     final rc = await _deliver(command);
     if (rc != 0) {
-      _completions.remove(id);
+      _completionRegistry.remove(id);
       return rc;
     }
     if (completer == null) {
       return 0;
     }
     return completer.future;
+  }
+
+  Future<int> reset() async {
+    await _ensureStarted();
+
+    final id = _nextCommandId++;
+    final completer = Completer<int>();
+    _completionRegistry.register(id, completer);
+    final rc = await _deliver({
+      'op': 'reset',
+      'id': id,
+      'reply': true,
+    });
+    if (rc != 0) {
+      _completionRegistry.remove(id);
+      return rc;
+    }
+    return completer.future;
+  }
+
+  Future<void> _ensureStarted({
+    List<String>? modulePaths,
+    Map<String, String>? environmentVariables,
+  }) {
+    final existing = _startFuture;
+    if (existing != null) {
+      return existing;
+    }
+
+    late final Future<void> startFuture;
+    startFuture = _start(
+      modulePaths: modulePaths,
+      environmentVariables: environmentVariables,
+    ).onError((Object error, StackTrace stackTrace) {
+      if (identical(_startFuture, startFuture)) {
+        _startFuture = null;
+      }
+      Error.throwWithStackTrace(error, stackTrace);
+    });
+    _startFuture = startFuture;
+    return startFuture;
   }
 
   Future<void> _start({
@@ -418,6 +501,17 @@ class _PersistentPythonRuntime {
       }
     }
 
+    final bindResult = await _deliverAndWait(
+      const {'op': 'bind'},
+      attempts: 400,
+    );
+    if (bindResult != 0) {
+      throw StateError(
+        'Persistent Python dispatcher did not bind the Dart runtime epoch '
+        '(code $bindResult)',
+      );
+    }
+
     final rc = await _deliver(const {'op': 'ping'}, attempts: 400);
     if (rc != 0) {
       throw StateError(
@@ -425,9 +519,38 @@ class _PersistentPythonRuntime {
     }
   }
 
+  Future<int> _deliverAndWait(
+    Map<String, Object?> message, {
+    int attempts = 40,
+  }) async {
+    final id = _nextCommandId++;
+    final completer = Completer<int>();
+    _completionRegistry.register(id, completer);
+    final rc = await _deliver({
+      ...message,
+      'id': id,
+      'reply': true,
+    }, attempts: attempts);
+    if (rc != 0) {
+      _completionRegistry.remove(id);
+      return rc;
+    }
+
+    try {
+      return await completer.future.timeout(const Duration(seconds: 10));
+    } on TimeoutException {
+      _completionRegistry.remove(id);
+      return -1;
+    }
+  }
+
   Future<int> _deliver(Map<String, Object?> message,
       {int attempts = 40}) async {
-    final bytes = utf8.encode(jsonEncode(message));
+    final bytes = utf8.encode(jsonEncode({
+      ...message,
+      'runtimeEpoch': _runtimeEpoch,
+      'runtimePort': _port,
+    }));
     for (var attempt = 0; attempt < attempts; attempt++) {
       final rc = _enqueue(bytes);
       if (rc == 0) {
@@ -463,11 +586,7 @@ class _PersistentPythonRuntime {
 
     try {
       final response = jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>;
-      final id = response['id'];
-      final rc = response['rc'];
-      if (id is int && rc is int) {
-        _completions.remove(id)?.complete(rc);
-      }
+      _completionRegistry.complete(response);
     } catch (_) {
       // The runtime channel only accepts JSON completion messages.
     }
@@ -486,12 +605,30 @@ import dart_bridge
 
 _control_port = __CONTROL_PORT__
 _stop_event = threading.Event()
+_runtime_original_environment = dict(os.environ)
+_managed_environment_keys = set()
+_dispatch_condition = threading.Condition()
+_runtime_epoch = None
+_epoch_bind_pending = True
+_active_target_count = 0
+_command_queue = []
+_dispatch_worker_running = False
+_runtime_module_prefixes = ("pyrite_sdk",)
+
+
+def _is_runtime_module(name):
+    return any(
+        name == prefix or name.startswith(prefix + ".")
+        for prefix in _runtime_module_prefixes
+    )
 
 
 def _apply_context(command):
     environment = command.get("environmentVariables") or {}
     for key, value in environment.items():
-        os.environ[str(key)] = str(value)
+        key = str(key)
+        os.environ[key] = str(value)
+        _managed_environment_keys.add(key)
 
     module_paths = command.get("modulePaths") or []
     for value in reversed(module_paths):
@@ -521,16 +658,25 @@ def _send_result(command, result):
     if not command.get("reply"):
         return
     payload = json.dumps({
+        "runtimeEpoch": command.get("runtimeEpoch"),
         "id": command.get("id"),
         "rc": result,
     }).encode("utf-8")
     dart_bridge.send_bytes(_control_port, payload)
 
 
+def _is_current_epoch(command):
+    with _dispatch_condition:
+        return command.get("runtimeEpoch") == _runtime_epoch
+
+
 def _run_command(command):
     result = 0
     try:
-        result = _execute(command)
+        if not _is_current_epoch(command):
+            result = 1
+        else:
+            result = _execute(command)
     except SystemExit as error:
         if error.code is None:
             result = 0
@@ -544,29 +690,209 @@ def _run_command(command):
     _send_result(command, result)
 
 
+def _run_target(command):
+    global _active_target_count
+    try:
+        _run_command(command)
+    finally:
+        with _dispatch_condition:
+            _active_target_count -= 1
+            if _active_target_count == 0:
+                _dispatch_condition.notify_all()
+
+
+def _start_target(command):
+    global _active_target_count
+    if not _is_current_epoch(command):
+        with _dispatch_condition:
+            _active_target_count -= 1
+            if _active_target_count == 0:
+                _dispatch_condition.notify_all()
+        _send_result(command, 1)
+        return
+    try:
+        thread = threading.Thread(
+            target=_run_target,
+            args=(command,),
+            name="serious-python-target",
+            daemon=True,
+        )
+        thread.start()
+    except BaseException:
+        with _dispatch_condition:
+            _active_target_count -= 1
+            if _active_target_count == 0:
+                _dispatch_condition.notify_all()
+        traceback.print_exc()
+        try:
+            _send_result(command, 1)
+        except BaseException:
+            traceback.print_exc()
+
+
+def _reset_command(command):
+    result = 0
+    try:
+        if not _is_current_epoch(command):
+            result = 1
+        else:
+            original_path = getattr(sys, "_runtime_original_sys_path", None)
+            if original_path is not None:
+                sys.path[:] = list(original_path)
+
+            original_modules = getattr(
+                sys,
+                "_runtime_original_modules_keys",
+                None,
+            )
+            if original_modules is not None:
+                for name in list(sys.modules):
+                    if (
+                        name not in original_modules
+                        and not _is_runtime_module(name)
+                    ):
+                        del sys.modules[name]
+
+            for key in tuple(_managed_environment_keys):
+                if key in _runtime_original_environment:
+                    os.environ[key] = _runtime_original_environment[key]
+                else:
+                    os.environ.pop(key, None)
+            _managed_environment_keys.clear()
+    except BaseException:
+        traceback.print_exc()
+        result = 1
+    _send_result(command, result)
+
+
+def _dispatch_worker():
+    global _active_target_count
+    global _dispatch_worker_running
+    while True:
+        with _dispatch_condition:
+            if not _command_queue:
+                _dispatch_worker_running = False
+                return
+            command = _command_queue.pop(0)
+            operation = command.get("op")
+            if operation == "run":
+                _active_target_count += 1
+            elif operation == "reset":
+                while _active_target_count > 0:
+                    _dispatch_condition.wait()
+            else:
+                continue
+
+        if operation == "run":
+            try:
+                _start_target(command)
+            except BaseException:
+                traceback.print_exc()
+            continue
+
+        try:
+            _reset_command(command)
+        except BaseException:
+            # Keep the ordered dispatcher alive if native completion delivery
+            # fails after the reset itself has already finished.
+            traceback.print_exc()
+            try:
+                _send_result(command, 1)
+            except BaseException:
+                traceback.print_exc()
+
+
+def _dispatch_command(command):
+    global _dispatch_worker_running
+    rejected = False
+    start_worker = False
+    with _dispatch_condition:
+        if command.get("runtimeEpoch") != _runtime_epoch:
+            rejected = True
+        else:
+            _command_queue.append(command)
+            if not _dispatch_worker_running:
+                _dispatch_worker_running = True
+                start_worker = True
+    if rejected:
+        _send_result(command, 1)
+        return
+    if not start_worker:
+        return
+    try:
+        thread = threading.Thread(
+            target=_dispatch_worker,
+            name="serious-python-dispatch",
+            daemon=True,
+        )
+        thread.start()
+    except BaseException:
+        with _dispatch_condition:
+            failed_commands = list(_command_queue)
+            _command_queue.clear()
+            _dispatch_worker_running = False
+        traceback.print_exc()
+        for failed_command in failed_commands:
+            try:
+                _send_result(failed_command, 1)
+            except BaseException:
+                traceback.print_exc()
+
+
 def _handle(payload):
+    global _runtime_epoch
+    global _epoch_bind_pending
     command = json.loads(bytes(payload).decode("utf-8"))
     operation = command.get("op")
+    if command.get("runtimePort") != _control_port:
+        _send_result(command, 1)
+        return
+    if operation == "bind":
+        epoch = command.get("runtimeEpoch")
+        if not isinstance(epoch, str) or not epoch:
+            _send_result(command, 1)
+            return
+        with _dispatch_condition:
+            if not _epoch_bind_pending and epoch != _runtime_epoch:
+                rejected = True
+            else:
+                rejected = False
+                _runtime_epoch = epoch
+                _epoch_bind_pending = False
+                _command_queue.clear()
+        if rejected:
+            _send_result(command, 1)
+            return
+        _send_result(command, 0)
+        return
+    if command.get("runtimeEpoch") != _runtime_epoch:
+        _send_result(command, 1)
+        return
     if operation == "ping":
         return
     if operation == "shutdown":
         _stop_event.set()
         return
+    if operation == "reset":
+        _dispatch_command(command)
+        return
     if operation != "run":
         return
-    thread = threading.Thread(
-        target=_run_command,
-        args=(command,),
-        name="serious-python-target",
-        daemon=True,
-    )
-    thread.start()
+    _dispatch_command(command)
 
 
 def _restart_session(ports):
     global _control_port
+    global _runtime_epoch
+    global _epoch_bind_pending
     new_port = int(ports.get("serious_python_runtime", 0))
-    if new_port <= 0 or new_port == _control_port:
+    if new_port <= 0:
+        return
+    with _dispatch_condition:
+        _runtime_epoch = None
+        _epoch_bind_pending = True
+        _command_queue.clear()
+    if new_port == _control_port:
         return
     dart_bridge.set_enqueue_handler_func(_control_port, None)
     _control_port = new_port
