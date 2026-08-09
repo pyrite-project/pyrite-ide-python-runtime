@@ -11,7 +11,7 @@ const dartBridgeVersionEnvironmentVariable = "DART_BRIDGE_VERSION";
 
 /// python-build release the bundled runtimes come from (YYYYMMDD).
 const pythonReleaseDate = "20260712";
-const dartBridgeVersion = "1.5.1";
+const dartBridgeVersion = "1.7.1";
 const defaultPythonVersion = "3.14";
 
 class PythonRelease {
