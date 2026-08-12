@@ -147,7 +147,9 @@ apply_standard_settings(${PLUGIN_NAME})
 # between plugins. This should not be removed; any symbols that should be
 # exported should be explicitly exported with the FLUTTER_PLUGIN_EXPORT macro.
 set_target_properties(${PLUGIN_NAME} PROPERTIES
-  CXX_VISIBILITY_PRESET hidden)
+  CXX_VISIBILITY_PRESET hidden
+  BUILD_WITH_INSTALL_RPATH TRUE
+  INSTALL_RPATH "$ORIGIN")
 target_compile_definitions(${PLUGIN_NAME} PRIVATE FLUTTER_PLUGIN_IMPL)
 
 # Source include directories and library dependencies. Add any plugin-specific
@@ -158,6 +160,12 @@ target_include_directories(${PLUGIN_NAME} INTERFACE
 
 target_link_libraries(${PLUGIN_NAME} PRIVATE flutter)
 target_link_libraries(${PLUGIN_NAME} PRIVATE PkgConfig::GTK)
+# Linux Python extension wheels intentionally leave Python C API symbols
+# unresolved and expect the host process to provide them. Make the versioned
+# runtime a startup dependency of the Flutter plugin so its symbols enter the
+# process-global lookup scope before Dart opens libdart_bridge.so.
+target_link_libraries(${PLUGIN_NAME} PRIVATE
+  "${PYTHON_PACKAGE}/lib/libpython${PYTHON_VERSION}.so.1.0")
 
 # List of absolute paths to libraries that should be bundled with the plugin.
 # Includes libdart_bridge.so (downloaded above) so Flutter copies it into the

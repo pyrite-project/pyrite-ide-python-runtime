@@ -1,4 +1,4 @@
 # dart_bridge is bundled with every serious_python app as a built-in module.
-# On Windows, pydantic-core exercises a normal release-ABI native wheel in the
+# On Linux and Windows, pydantic-core exercises a normal native wheel in the
 # Flutter Debug integration test.
-pydantic-core==2.46.4; sys_platform == "win32"
+pydantic-core==2.46.4; sys_platform == "linux" or sys_platform == "win32"

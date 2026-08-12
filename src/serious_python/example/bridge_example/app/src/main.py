@@ -27,7 +27,7 @@ import tracemalloc
 
 import dart_bridge
 
-if sys.platform == "win32":
+if sys.platform in {"linux", "win32"}:
     import pydantic_core as _pydantic_core
 
     print(

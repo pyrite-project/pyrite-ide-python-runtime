@@ -1,3 +1,9 @@
+## Unreleased
+
+* Load the bundled versioned `libpython` as a process-startup dependency so
+  Linux native extension wheels can resolve Python C API symbols such as
+  `PyModuleDef_Init` when the interpreter is embedded through Dart FFI.
+
 ## 4.3.2
 
 * Bump the bundled python-build snapshot to `20260712`; aligns with the `serious_python_*` 4.3.2 release. The release contains only Android/iOS runtime fixes — no Linux-affecting changes.

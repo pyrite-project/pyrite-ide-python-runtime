@@ -3,6 +3,8 @@
 #include <flutter_linux/flutter_linux.h>
 #include <gtk/gtk.h>
 
+extern "C" int Py_IsInitialized(void);
+
 // Plugin-registration shell only — all method calls return NotImplemented.
 // Python lifecycle lives in libdart_bridge.so, invoked from Dart via FFI.
 
@@ -47,6 +49,11 @@ static void method_call_cb(FlMethodChannel *channel, FlMethodCall *method_call,
 
 void serious_python_linux_plugin_register_with_registrar(FlPluginRegistrar *registrar)
 {
+  // Keep libpython as a real DT_NEEDED dependency. The call is safe before
+  // initialization and prevents --as-needed from dropping the library whose
+  // global C API symbols are required by extension modules.
+  (void)Py_IsInitialized();
+
   SeriousPythonLinuxPlugin *plugin = SERIOUS_PYTHON_LINUX_PLUGIN(
       g_object_new(serious_python_linux_plugin_get_type(), nullptr));
 
