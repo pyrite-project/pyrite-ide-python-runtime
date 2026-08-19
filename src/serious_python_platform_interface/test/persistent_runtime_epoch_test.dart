@@ -80,5 +80,27 @@ void main() {
         isFalse,
       );
     });
+
+    test('completion diagnostics are retained until consumed', () async {
+      final registry = PersistentRuntimeCompletionRegistry('epoch');
+      final completion = Completer<int>();
+      registry.register(4, completion);
+
+      expect(
+        registry.complete({
+          'runtimeEpoch': 'epoch',
+          'id': 4,
+          'rc': 1,
+          'error': 'Traceback (most recent call last):\nValueError: boom',
+        }),
+        isTrue,
+      );
+      expect(await completion.future, 1);
+      expect(
+        registry.takeError(4),
+        'Traceback (most recent call last):\nValueError: boom',
+      );
+      expect(registry.takeError(4), isNull);
+    });
   });
 }

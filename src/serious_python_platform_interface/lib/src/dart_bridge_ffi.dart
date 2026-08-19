@@ -357,6 +357,49 @@ Future<int> runPersistentPython({
   );
 }
 
+/// Runs a target and returns both its exit code and Python diagnostic output.
+///
+/// The detailed error is populated for synchronous targets that fail while
+/// executing Python code. Asynchronous targets return immediately with a
+/// successful spawn result and therefore have no completion diagnostic.
+Future<PersistentPythonRunResult> runPersistentPythonDetailed({
+  required DartBridge bridge,
+  String? appPath,
+  String? script,
+  String? programName,
+  List<String>? modulePaths,
+  Map<String, String>? environmentVariables,
+  bool sync = false,
+}) {
+  final normalizedScript = script != null && script.isEmpty ? null : script;
+  if ((appPath == null) == (normalizedScript == null)) {
+    throw ArgumentError(
+        'Provide exactly one of appPath / script (got both or neither)');
+  }
+
+  final runtime = _persistentRuntime ??= _PersistentPythonRuntime(bridge);
+  if (!identical(runtime.bridge, bridge)) {
+    throw StateError(
+        'Persistent Python runtime is already using another bridge');
+  }
+  return runtime.runDetailed(
+    appPath: appPath,
+    script: normalizedScript,
+    programName: programName,
+    modulePaths: modulePaths,
+    environmentVariables: environmentVariables,
+    sync: sync,
+  );
+}
+
+/// The result of a persistent Python target.
+final class PersistentPythonRunResult {
+  const PersistentPythonRunResult(this.exitCode, {this.error});
+
+  final int exitCode;
+  final String? error;
+}
+
 /// Restores the shared interpreter to the snapshot captured by the runtime
 /// bootstrap without finalizing CPython.
 Future<int> resetPersistentPython({required DartBridge bridge}) {
@@ -405,6 +448,25 @@ class _PersistentPythonRuntime {
     Map<String, String>? environmentVariables,
     required bool sync,
   }) async {
+    final result = await runDetailed(
+      appPath: appPath,
+      script: script,
+      programName: programName,
+      modulePaths: modulePaths,
+      environmentVariables: environmentVariables,
+      sync: sync,
+    );
+    return result.exitCode;
+  }
+
+  Future<PersistentPythonRunResult> runDetailed({
+    String? appPath,
+    String? script,
+    String? programName,
+    List<String>? modulePaths,
+    Map<String, String>? environmentVariables,
+    required bool sync,
+  }) async {
     await _ensureStarted(
       modulePaths: modulePaths,
       environmentVariables: environmentVariables,
@@ -431,12 +493,16 @@ class _PersistentPythonRuntime {
     final rc = await _deliver(command);
     if (rc != 0) {
       _completionRegistry.remove(id);
-      return rc;
+      return PersistentPythonRunResult(rc);
     }
     if (completer == null) {
-      return 0;
+      return const PersistentPythonRunResult(0);
     }
-    return completer.future;
+    final result = await completer.future;
+    return PersistentPythonRunResult(
+      result,
+      error: _completionRegistry.takeError(id),
+    );
   }
 
   Future<int> reset() async {
@@ -654,13 +720,14 @@ def _execute(command):
     return 0
 
 
-def _send_result(command, result):
+def _send_result(command, result, error=None):
     if not command.get("reply"):
         return
     payload = json.dumps({
         "runtimeEpoch": command.get("runtimeEpoch"),
         "id": command.get("id"),
         "rc": result,
+        "error": error,
     }).encode("utf-8")
     dart_bridge.send_bytes(_control_port, payload)
 
@@ -672,22 +739,25 @@ def _is_current_epoch(command):
 
 def _run_command(command):
     result = 0
+    error = None
     try:
         if not _is_current_epoch(command):
             result = 1
         else:
             result = _execute(command)
-    except SystemExit as error:
-        if error.code is None:
+    except SystemExit as system_exit:
+        if system_exit.code is None:
             result = 0
-        elif isinstance(error.code, int):
-            result = error.code
+        elif isinstance(system_exit.code, int):
+            result = system_exit.code
         else:
             result = 1
+            error = "SystemExit: %r" % (system_exit.code,)
     except BaseException:
+        error = traceback.format_exc()
         traceback.print_exc()
         result = 1
-    _send_result(command, result)
+    _send_result(command, result, error)
 
 
 def _run_target(command):
@@ -723,9 +793,10 @@ def _start_target(command):
             _active_target_count -= 1
             if _active_target_count == 0:
                 _dispatch_condition.notify_all()
+        error = traceback.format_exc()
         traceback.print_exc()
         try:
-            _send_result(command, 1)
+            _send_result(command, 1, error)
         except BaseException:
             traceback.print_exc()
 

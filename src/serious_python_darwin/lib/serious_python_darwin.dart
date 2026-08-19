@@ -65,7 +65,7 @@ class SeriousPythonDarwin extends SeriousPythonPlatform {
     };
 
     final hasScript = script != null && script.isNotEmpty;
-    final rc = await runPersistentPython(
+    final result = await runPersistentPythonDetailed(
       bridge: DartBridge.instance,
       appPath: hasScript ? null : appPath,
       script: hasScript ? script : null,
@@ -76,9 +76,9 @@ class SeriousPythonDarwin extends SeriousPythonPlatform {
 
     // sync=true: rc is the Python exit code. sync=false: rc is the spawn
     // result (0 = worker thread started successfully).
-    if (rc != 0) {
-      return 'Python exited with code $rc';
-    }
-    return null;
+    if (result.error != null) return result.error;
+    return result.exitCode != 0
+        ? 'Python exited with code ${result.exitCode}'
+        : null;
   }
 }

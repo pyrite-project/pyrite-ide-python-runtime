@@ -15,6 +15,7 @@ class PersistentRuntimeCompletionRegistry {
 
   final String epoch;
   final Map<_PersistentRuntimeCompletionKey, Completer<int>> _completions = {};
+  final Map<_PersistentRuntimeCompletionKey, String> _errors = {};
 
   void register(int commandId, Completer<int> completer) {
     final key = _PersistentRuntimeCompletionKey(epoch, commandId);
@@ -25,8 +26,16 @@ class PersistentRuntimeCompletionRegistry {
   }
 
   bool remove(int commandId) =>
-      _completions.remove(_PersistentRuntimeCompletionKey(epoch, commandId)) !=
-      null;
+      _remove(_PersistentRuntimeCompletionKey(epoch, commandId));
+
+  bool _remove(_PersistentRuntimeCompletionKey key) {
+    _errors.remove(key);
+    return _completions.remove(key) != null;
+  }
+
+  /// Returns and clears the diagnostic text attached to a completed command.
+  String? takeError(int commandId) =>
+      _errors.remove(_PersistentRuntimeCompletionKey(epoch, commandId));
 
   /// Applies a native completion if it belongs to this runtime epoch.
   ///
@@ -41,9 +50,11 @@ class PersistentRuntimeCompletionRegistry {
       return false;
     }
 
-    final completer =
-        _completions.remove(_PersistentRuntimeCompletionKey(epoch, commandId));
+    final key = _PersistentRuntimeCompletionKey(epoch, commandId);
+    final completer = _completions.remove(key);
     if (completer == null || completer.isCompleted) return false;
+    final error = response['error'];
+    if (error is String && error.isNotEmpty) _errors[key] = error;
     completer.complete(result);
     return true;
   }
