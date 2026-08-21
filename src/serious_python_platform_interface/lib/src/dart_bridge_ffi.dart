@@ -420,6 +420,64 @@ String _newRuntimeEpoch(int port) {
   return '${DateTime.now().microsecondsSinceEpoch}-$port-$counter';
 }
 
+/// Keep the native interpreter bootstrap independent from the first target.
+///
+/// The Darwin/Linux/Windows adapters put the target's directories in
+/// `PYTHONPATH` so CPython can start from the bundled runtime.  CPython reads
+/// that variable while it builds its initial `sys.path`; passing the complete
+/// value to the persistent dispatcher would therefore make the first plugin
+/// path part of the process-wide baseline.  Only paths below `PYTHONHOME` are
+/// runtime-owned and may be captured by that baseline.
+Map<String, String>? _persistentBootstrapEnvironment(
+  Map<String, String>? environmentVariables,
+  List<String>? modulePaths,
+) {
+  final environment = <String, String>{
+    ...?environmentVariables,
+  };
+  final pythonHome = _normalizedRuntimePath(environment['PYTHONHOME']);
+  if (pythonHome.isEmpty) {
+    return environment.isEmpty ? null : environment;
+  }
+
+  final separator = Platform.isWindows ? ';' : ':';
+  final candidates = <String>[];
+  final configuredPath = environment['PYTHONPATH'];
+  if (configuredPath != null) {
+    candidates.addAll(configuredPath.split(separator));
+  }
+  candidates.addAll(modulePaths ?? const <String>[]);
+
+  final runtimePaths = <String>[];
+  for (final candidate in candidates) {
+    final normalized = _normalizedRuntimePath(candidate);
+    if (normalized.isEmpty ||
+        (normalized != pythonHome && !normalized.startsWith('$pythonHome/'))) {
+      continue;
+    }
+    if (!runtimePaths.contains(candidate)) {
+      runtimePaths.add(candidate);
+    }
+  }
+
+  // Keep the original value if it cannot be classified.  This preserves
+  // startup compatibility for custom embedders whose PYTHONHOME is not a
+  // filesystem root, while the bundled runtime takes the isolated path.
+  if (runtimePaths.isNotEmpty) {
+    environment['PYTHONPATH'] = runtimePaths.join(separator);
+  }
+  return environment.isEmpty ? null : environment;
+}
+
+String _normalizedRuntimePath(String? value) {
+  if (value == null) return '';
+  var normalized = value.trim().replaceAll('\\', '/');
+  while (normalized.length > 1 && normalized.endsWith('/')) {
+    normalized = normalized.substring(0, normalized.length - 1);
+  }
+  return normalized;
+}
+
 class _PersistentPythonRuntime {
   _PersistentPythonRuntime(this.bridge, {String? runtimeEpoch}) {
     _completionRegistry = PersistentRuntimeCompletionRegistry(
@@ -555,11 +613,21 @@ class _PersistentPythonRuntime {
     } else {
       final bootstrap =
           _persistentRuntimeBootstrap.replaceAll('__CONTROL_PORT__', '$_port');
+      // CPython needs the platform-provided PYTHONHOME/PYTHONPATH during
+      // initialization so it can import the stdlib `encodings` package.
+      // These values are only used for this native startup call; subsequent
+      // plugin targets receive their own thread-local context below.
       final rc = runPython(
         bridge: bridge,
         script: bootstrap,
-        modulePaths: modulePaths,
-        environmentVariables: environmentVariables,
+        // The startup environment already carries the bundled stdlib through
+        // PYTHONPATH. Do not stamp the first target's app paths into the
+        // interpreter snapshot; they belong only to that target.
+        modulePaths: const <String>[],
+        environmentVariables: _persistentBootstrapEnvironment(
+          environmentVariables,
+          modulePaths,
+        ),
       );
       if (rc != 0) {
         throw StateError(
@@ -660,51 +728,724 @@ class _PersistentPythonRuntime {
 }
 
 const _persistentRuntimeBootstrap = r'''
+import builtins
+import importlib
+import importlib.machinery
+import importlib.metadata
 import json
 import os
+import re
 import runpy
+import subprocess as _runtime_subprocess
 import sys
 import threading
 import traceback
 
 import dart_bridge
 
+
 _control_port = __CONTROL_PORT__
 _stop_event = threading.Event()
 _runtime_original_environment = dict(os.environ)
-_managed_environment_keys = set()
 _dispatch_condition = threading.Condition()
 _runtime_epoch = None
 _epoch_bind_pending = True
 _active_target_count = 0
 _command_queue = []
 _dispatch_worker_running = False
-_runtime_module_prefixes = ("pyrite_sdk",)
+_runtime_base_sys_path = tuple(sys.path)
+_runtime_base_modules = dict(sys.modules)
+_runtime_base_module_names = frozenset(_runtime_base_modules)
+_runtime_base_path_names = frozenset(
+    os.path.abspath(value).rstrip(os.sep)
+    for value in _runtime_base_sys_path
+    if value and value != "."
+)
+_runtime_import_lock = threading.RLock()
+_runtime_thread_context = threading.local()
+_runtime_contexts = set()
+_runtime_shared_modules = {}
+_runtime_stdlib_modules = {}
+_runtime_shared_package_names = set()
+_runtime_extension_suffixes = tuple(importlib.machinery.EXTENSION_SUFFIXES)
+_runtime_original_import = builtins.__import__
+_runtime_original_import_module = importlib.import_module
+_runtime_original_environ = os.environ
+_runtime_original_environb = getattr(os, "environb", None)
+_runtime_original_putenv = os.putenv
+_runtime_original_unsetenv = os.unsetenv
+_runtime_original_system = os.system
+_runtime_original_popen_init = _runtime_subprocess.Popen.__init__
+_runtime_original_thread_start = threading.Thread.start
+_runtime_original_bootstrap_inner = threading.Thread._bootstrap_inner
+_runtime_threading_patched = False
+_runtime_native_environment_lock = threading.RLock()
 
 
-def _is_runtime_module(name):
-    return any(
-        name == prefix or name.startswith(prefix + ".")
-        for prefix in _runtime_module_prefixes
+def _current_context():
+    return getattr(_runtime_thread_context, "context", None)
+
+
+class _RuntimePath(list):
+    """A list-shaped sys.path with a per-thread target view."""
+
+    def __init__(self, initial):
+        super().__init__(initial)
+        self._base = list(initial)
+
+    def _target(self):
+        context = _current_context()
+        return context.sys_path if context is not None else self._base
+
+    def __len__(self):
+        return len(self._target())
+
+    def __iter__(self):
+        return iter(self._target())
+
+    def __getitem__(self, index):
+        return self._target()[index]
+
+    def __setitem__(self, index, value):
+        self._target()[index] = value
+
+    def __delitem__(self, index):
+        del self._target()[index]
+
+    def __contains__(self, value):
+        return value in self._target()
+
+    def __repr__(self):
+        return repr(self._target())
+
+    def __eq__(self, other):
+        return self._target() == other
+
+    def __add__(self, other):
+        return self._target() + other
+
+    def __radd__(self, other):
+        return other + self._target()
+
+    def copy(self):
+        return self._target().copy()
+
+    def count(self, value):
+        return self._target().count(value)
+
+    def index(self, value, *args):
+        return self._target().index(value, *args)
+
+    def insert(self, index, value):
+        self._target().insert(index, value)
+
+    def append(self, value):
+        self._target().append(value)
+
+    def extend(self, values):
+        self._target().extend(values)
+
+    def clear(self):
+        self._target().clear()
+
+    def pop(self, index=-1):
+        return self._target().pop(index)
+
+    def remove(self, value):
+        self._target().remove(value)
+
+    def reverse(self):
+        self._target().reverse()
+
+    def sort(self, *args, **kwargs):
+        self._target().sort(*args, **kwargs)
+
+    def __iadd__(self, values):
+        self._target().extend(values)
+        return self
+
+    def __imul__(self, value):
+        target = self._target()
+        target *= value
+        return self
+
+
+def _patch_runtime_threading():
+    global _runtime_threading_patched
+    if _runtime_threading_patched:
+        return
+    _runtime_threading_patched = True
+
+    def start(thread, *args, **kwargs):
+        # The context is intentionally attached to the Thread object rather
+        # than copied into a global. This keeps each plugin's child threads
+        # bound to its own environment and import cache.
+        thread._pyrite_runtime_context = _current_context()
+        try:
+            return _runtime_original_thread_start(thread, *args, **kwargs)
+        except BaseException:
+            thread._pyrite_runtime_context = None
+            raise
+
+    def bootstrap_inner(thread, *args, **kwargs):
+        context = getattr(thread, "_pyrite_runtime_context", None)
+        previous = _current_context()
+        if context is not None:
+            _runtime_thread_context.context = context
+            _runtime_contexts.add(context)
+        try:
+            return _runtime_original_bootstrap_inner(thread, *args, **kwargs)
+        finally:
+            thread._pyrite_runtime_context = None
+            if context is not None:
+                _runtime_contexts.discard(context)
+            if previous is None:
+                try:
+                    del _runtime_thread_context.context
+                except AttributeError:
+                    pass
+            else:
+                _runtime_thread_context.context = previous
+
+    threading.Thread.start = start
+    threading.Thread._bootstrap_inner = bootstrap_inner
+
+
+_patch_runtime_threading()
+sys.path = _RuntimePath(_runtime_base_sys_path)
+
+
+def _is_native_extension(module):
+    origin = getattr(module, "__file__", None)
+    if not origin:
+        spec = getattr(module, "__spec__", None)
+        origin = getattr(spec, "origin", None) if spec is not None else None
+    return bool(
+        origin
+        and any(str(origin).endswith(suffix) for suffix in _runtime_extension_suffixes)
     )
 
 
-def _apply_context(command):
-    environment = command.get("environmentVariables") or {}
-    for key, value in environment.items():
-        key = str(key)
-        os.environ[key] = str(value)
-        _managed_environment_keys.add(key)
+def _module_origin(module):
+    origin = getattr(module, "__file__", None)
+    if not origin:
+        spec = getattr(module, "__spec__", None)
+        origin = getattr(spec, "origin", None) if spec is not None else None
+    if origin:
+        return str(origin)
+    return None
 
-    module_paths = command.get("modulePaths") or []
-    for value in reversed(module_paths):
-        normalized = os.path.abspath(str(value))
-        if normalized not in sys.path:
-            sys.path.insert(0, normalized)
+
+def _is_runtime_module(module):
+    origin = _module_origin(module)
+    if not origin or origin in ("built-in", "frozen"):
+        return True
+    normalized = os.path.abspath(origin).rstrip(os.sep)
+    return any(
+        normalized == root or normalized.startswith(root + os.sep)
+        for root in _runtime_base_path_names
+        if root
+    )
+
+
+def _is_shared_module_name(module_name):
+    return any(
+        module_name == package_name
+        or module_name.startswith(package_name + ".")
+        for package_name in _runtime_shared_package_names
+    )
+
+
+def _is_process_shared_module_name(module_name):
+    return module_name in _runtime_stdlib_modules or _is_shared_module_name(
+        module_name
+    )
+
+
+def _normalized_distribution_name(name):
+    return re.sub(r"[-_.]+", "-", str(name)).lower()
+
+
+def _native_wrapper_package_names(context, native_package_names):
+    try:
+        package_distributions = importlib.metadata.packages_distributions()
+    except Exception:
+        return set()
+
+    native_distribution_names = {
+        _normalized_distribution_name(distribution_name)
+        for package_name in native_package_names
+        for distribution_name in package_distributions.get(package_name, ())
+    }
+    if not native_distribution_names:
+        return set()
+
+    loaded_package_names = {
+        module_name.partition(".")[0]
+        for module_name, module in tuple(sys.modules.items())
+        if context._owns_module(module)
+    }
+    wrappers = set()
+    for package_name in loaded_package_names:
+        for distribution_name in package_distributions.get(package_name, ()):
+            try:
+                requirements = (
+                    importlib.metadata.distribution(distribution_name).requires
+                    or ()
+                )
+            except Exception:
+                continue
+            for requirement in requirements:
+                match = re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", requirement)
+                if match and _normalized_distribution_name(
+                    match.group(0)
+                ) in native_distribution_names:
+                    wrappers.add(package_name)
+                    break
+    return wrappers
+
+
+def _promote_native_packages(context):
+    # Native extensions are process-level CPython state. Some extensions,
+    # including PyO3 modules, look their Python package up in sys.modules long
+    # after import has returned. Their direct Python wrappers must share the
+    # same type identities too, so keep both layers coherent instead of trying
+    # to isolate or unload part of them per target.
+    native_package_names = set()
+    for module_name, module in tuple(sys.modules.items()):
+        if context._owns_module(module) and _is_native_extension(module):
+            native_package_names.add(module_name.partition(".")[0])
+
+    if not native_package_names:
+        return
+
+    wrapper_package_names = _native_wrapper_package_names(
+        context, native_package_names
+    )
+    _runtime_shared_package_names.update(native_package_names)
+    _runtime_shared_package_names.update(wrapper_package_names)
+
+    for module_name, module in tuple(sys.modules.items()):
+        if _is_shared_module_name(module_name):
+            _runtime_shared_modules[module_name] = module
+
+    # A package may have been captured by a context before its native child
+    # was imported. Once promoted, the process-wide instance is authoritative.
+    for context in tuple(_runtime_contexts):
+        for module_name in tuple(context.modules):
+            if _is_shared_module_name(module_name):
+                context.modules.pop(module_name, None)
+
+
+class _RuntimeEnvironment:
+    """A thread-aware view of os.environ for plugin targets."""
+
+    def __init__(self, fallback):
+        self._fallback = fallback
+
+    def _mapping(self):
+        context = _current_context()
+        return context.environment if context is not None else self._fallback
+
+    def __getitem__(self, key):
+        return self._mapping()[key]
+
+    def __setitem__(self, key, value):
+        self._mapping()[str(key)] = str(value)
+
+    def __delitem__(self, key):
+        del self._mapping()[key]
+
+    def __iter__(self):
+        return iter(self._mapping())
+
+    def __len__(self):
+        return len(self._mapping())
+
+    def __contains__(self, key):
+        return key in self._mapping()
+
+    def get(self, key, default=None):
+        return self._mapping().get(key, default)
+
+    def setdefault(self, key, default=None):
+        return self._mapping().setdefault(key, default)
+
+    def pop(self, key, *args):
+        return self._mapping().pop(key, *args)
+
+    def popitem(self):
+        return self._mapping().popitem()
+
+    def clear(self):
+        self._mapping().clear()
+
+    def update(self, *args, **kwargs):
+        self._mapping().update(*args, **kwargs)
+
+    def copy(self):
+        return self._mapping().copy()
+
+    def keys(self):
+        return self._mapping().keys()
+
+    def items(self):
+        return self._mapping().items()
+
+    def values(self):
+        return self._mapping().values()
+
+    def __repr__(self):
+        return repr(self._mapping())
+
+    def __getattr__(self, name):
+        # Keep compatibility with os._Environ helpers used by subprocess and
+        # a few stdlib modules (for example encodekey/encodevalue).
+        helpers = {
+            "encodekey": lambda value: os.fsencode(str(value)),
+            "decodekey": lambda value: os.fsdecode(value),
+            "encodevalue": lambda value: os.fsencode(str(value)),
+            "decodevalue": lambda value: os.fsdecode(value),
+        }
+        helper = helpers.get(name)
+        if helper is not None:
+            return helper
+        return getattr(self._mapping(), name)
+
+
+class _RuntimeEnvironmentBytes:
+    """Bytes-keyed companion view for os.environb."""
+
+    def __init__(self, text_environment):
+        self._text_environment = text_environment
+
+    @staticmethod
+    def _text_key(key):
+        return os.fsdecode(key) if isinstance(key, bytes) else str(key)
+
+    @staticmethod
+    def _text_value(value):
+        return os.fsdecode(value) if isinstance(value, bytes) else str(value)
+
+    @staticmethod
+    def _bytes_key(key):
+        return os.fsencode(key)
+
+    @staticmethod
+    def _bytes_value(value):
+        return os.fsencode(value)
+
+    def __getitem__(self, key):
+        return self._bytes_value(
+            self._text_environment[self._text_key(key)]
+        )
+
+    def __setitem__(self, key, value):
+        self._text_environment[self._text_key(key)] = self._text_value(value)
+
+    def __delitem__(self, key):
+        del self._text_environment[self._text_key(key)]
+
+    def __iter__(self):
+        return (self._bytes_key(key) for key in self._text_environment)
+
+    def __len__(self):
+        return len(self._text_environment)
+
+    def __contains__(self, key):
+        return self._text_key(key) in self._text_environment
+
+    def get(self, key, default=None):
+        value = self._text_environment.get(self._text_key(key), None)
+        if value is None:
+            return default
+        return self._bytes_value(value)
+
+    def setdefault(self, key, default=None):
+        value = self._text_environment.setdefault(
+            self._text_key(key), self._text_value(default) if default is not None else ""
+        )
+        return self._bytes_value(value)
+
+    def pop(self, key, *args):
+        value = self._text_environment.pop(self._text_key(key), *args)
+        if isinstance(value, str):
+            return self._bytes_value(value)
+        return value
+
+    def popitem(self):
+        key, value = self._text_environment.popitem()
+        return self._bytes_key(key), self._bytes_value(value)
+
+    def clear(self):
+        self._text_environment.clear()
+
+    def update(self, *args, **kwargs):
+        values = dict(*args, **kwargs)
+        for key, value in values.items():
+            self[self._text_key(key)] = value
+
+    def copy(self):
+        return {
+            self._bytes_key(key): self._bytes_value(value)
+            for key, value in self._text_environment.items()
+        }
+
+    def keys(self):
+        return tuple(self)
+
+    def items(self):
+        return tuple((key, self[key]) for key in self)
+
+    def values(self):
+        return tuple(self[key] for key in self)
+
+    def __repr__(self):
+        return repr(self.copy())
+
+    def encodekey(self, value):
+        return self._bytes_key(value)
+
+    def decodekey(self, value):
+        return os.fsdecode(value)
+
+    def encodevalue(self, value):
+        return self._bytes_value(value)
+
+    def decodevalue(self, value):
+        return os.fsdecode(value)
+
+
+def _as_environment_text(value):
+    if isinstance(value, bytes):
+        return os.fsdecode(value)
+    return str(value)
+
+
+def _runtime_putenv(key, value):
+    context = _current_context()
+    if context is None:
+        return _runtime_original_putenv(key, value)
+    context.environment[_as_environment_text(key)] = _as_environment_text(value)
+
+
+def _runtime_unsetenv(key):
+    context = _current_context()
+    if context is None:
+        return _runtime_original_unsetenv(key)
+    context.environment.pop(_as_environment_text(key), None)
+
+
+def _with_native_environment(callback, *args, **kwargs):
+    """Run a native environment consumer with the current target's env."""
+    context = _current_context()
+    if context is None:
+        return callback(*args, **kwargs)
+    with _runtime_native_environment_lock:
+        previous = dict(_runtime_original_environ)
+        _restore_process_environment(context.environment)
+        try:
+            return callback(*args, **kwargs)
+        finally:
+            _restore_process_environment(previous)
+
+
+def _runtime_popen_init(self, *args, **kwargs):
+    # Popen(env=None) inherits the C-level environ, bypassing our Python proxy.
+    # Materialize the current target environment so child processes cannot see
+    # another plugin's PATH or package configuration.
+    context = _current_context()
+    if context is not None:
+        if "env" in kwargs:
+            if kwargs["env"] is None:
+                kwargs["env"] = dict(context.environment)
+        elif len(args) <= 10:
+            kwargs["env"] = dict(context.environment)
+        elif args[10] is None:
+            args = list(args)
+            args[10] = dict(context.environment)
+            args = tuple(args)
+    return _runtime_original_popen_init(self, *args, **kwargs)
+
+
+def _restore_process_environment(values):
+    for key in tuple(_runtime_original_environ):
+        if key not in values:
+            _runtime_original_environ.pop(key, None)
+    for key, value in values.items():
+        if _runtime_original_environ.get(key) != value:
+            _runtime_original_environ[key] = value
+
+
+os.environ = _RuntimeEnvironment(_runtime_original_environ)
+if _runtime_original_environb is not None:
+    os.environb = _RuntimeEnvironmentBytes(os.environ)
+os.putenv = _runtime_putenv
+os.unsetenv = _runtime_unsetenv
+os.system = lambda command: _with_native_environment(
+    _runtime_original_system, command
+)
+_runtime_subprocess.Popen.__init__ = _runtime_popen_init
+
+
+def _wrap_inheriting_spawn(name):
+    original = getattr(os, name, None)
+    if original is None:
+        return
+    globals()["_runtime_original_" + name] = original
+    setattr(
+        os,
+        name,
+        lambda *args, _original=original, **kwargs: _with_native_environment(
+            _original, *args, **kwargs
+        ),
+    )
+
+
+for _spawn_name in ("spawnv", "spawnvp", "spawnl", "spawnlp"):
+    _wrap_inheriting_spawn(_spawn_name)
+
+
+class _RuntimeContext:
+    """Serialized import/environment context for one plugin target."""
+
+    def __init__(self, command):
+        self.environment = dict(_runtime_original_environment)
+        for key, value in (command.get("environmentVariables") or {}).items():
+            self.environment[str(key)] = str(value)
+
+        paths = []
+        for value in command.get("modulePaths") or []:
+            normalized = os.path.abspath(str(value)).rstrip(os.sep)
+            if normalized and normalized not in paths:
+                paths.append(normalized)
+        self.sys_path = list(paths) + [
+            value
+            for value in _runtime_base_sys_path
+            if value not in paths
+        ]
+        self.module_roots = tuple(
+            value for value in paths if value not in _runtime_base_path_names
+        )
+        app_path = command.get("appPath")
+        if app_path:
+            app_root = os.path.abspath(os.path.dirname(str(app_path))).rstrip(
+                os.sep
+            )
+            if app_root and app_root not in _runtime_base_path_names:
+                if app_root not in self.module_roots:
+                    self.module_roots = (app_root,) + self.module_roots
+        self.modules = {}
+        self._import_depth = 0
+
+    def _owns_module(self, module):
+        candidates = []
+        origin = getattr(module, "__file__", None)
+        if origin:
+            candidates.append(origin)
+        spec = getattr(module, "__spec__", None)
+        if spec is not None and getattr(spec, "origin", None):
+            candidates.append(spec.origin)
+        package_path = getattr(module, "__path__", None)
+        if package_path:
+            candidates.extend(package_path)
+        for candidate in candidates:
+            if not candidate or candidate in ("built-in", "frozen"):
+                continue
+            normalized = os.path.abspath(str(candidate)).rstrip(os.sep)
+            for root in self.module_roots:
+                if normalized == root or normalized.startswith(root + os.sep):
+                    return True
+        return False
+
+    def run(self, callback):
+        previous = _current_context()
+        _runtime_thread_context.context = self
+        _runtime_contexts.add(self)
+        try:
+            return callback()
+        finally:
+            _runtime_contexts.discard(self)
+            if previous is None:
+                try:
+                    del _runtime_thread_context.context
+                except AttributeError:
+                    pass
+            else:
+                _runtime_thread_context.context = previous
+
+    def _with_import(self, callback):
+        if self._import_depth:
+            return callback()
+        with _runtime_import_lock:
+            self._import_depth += 1
+            previous_path = list(sys.path)
+            previous_modules = dict(sys.modules)
+            try:
+                # Remove modules owned by another target, then restore this
+                # target's private module cache while the import is resolved.
+                for other in tuple(_runtime_contexts):
+                    if other is self:
+                        continue
+                    for module_name in tuple(other.modules):
+                        if not _is_shared_module_name(module_name):
+                            sys.modules.pop(module_name, None)
+                sys.modules.update(self.modules)
+                sys.modules.update(_runtime_shared_modules)
+                sys.path[:] = self.sys_path
+                result = callback()
+                _promote_native_packages(self)
+                self.modules = {
+                    module_name: module
+                    for module_name, module in sys.modules.items()
+                    if self._owns_module(module)
+                    and not _is_shared_module_name(module_name)
+                }
+                return result
+            finally:
+                # Restore the process-wide table exactly as it was before the
+                # import. Plugin code keeps direct references to its modules.
+                for module_name in tuple(sys.modules):
+                    if module_name not in previous_modules:
+                        sys.modules.pop(module_name, None)
+                for module_name, module in previous_modules.items():
+                    sys.modules[module_name] = module
+                sys.modules.update(_runtime_shared_modules)
+                sys.path[:] = previous_path
+                self._import_depth -= 1
+
+    def import_module(self, name, globals, locals, fromlist, level):
+        return self._with_import(
+            lambda: _runtime_original_import(
+                name, globals, locals, fromlist, level
+            )
+        )
+
+    def importlib_module(self, name, package=None):
+        return self._with_import(
+            lambda: _runtime_original_import_module(name, package)
+        )
+
+
+def _runtime_import(name, globals=None, locals=None, fromlist=(), level=0):
+    context = _current_context()
+    if context is None:
+        return _runtime_original_import(name, globals, locals, fromlist, level)
+    return context.import_module(name, globals, locals, fromlist, level)
+
+
+def _runtime_import_module(name, package=None):
+    context = _current_context()
+    if context is None:
+        return _runtime_original_import_module(name, package)
+    return context.importlib_module(name, package)
+
+
+builtins.__import__ = _runtime_import
+importlib.import_module = _runtime_import_module
 
 
 def _execute(command):
-    _apply_context(command)
     script = command.get("script")
     if script is None or script == "":
         runpy.run_path(command["appPath"], run_name="__main__")
@@ -740,11 +1481,13 @@ def _is_current_epoch(command):
 def _run_command(command):
     result = 0
     error = None
+    context = None
     try:
         if not _is_current_epoch(command):
             result = 1
         else:
-            result = _execute(command)
+            context = _RuntimeContext(command)
+            result = context.run(lambda: _execute(command))
     except SystemExit as system_exit:
         if system_exit.code is None:
             result = 0
@@ -807,29 +1550,17 @@ def _reset_command(command):
         if not _is_current_epoch(command):
             result = 1
         else:
-            original_path = getattr(sys, "_runtime_original_sys_path", None)
-            if original_path is not None:
-                sys.path[:] = list(original_path)
-
-            original_modules = getattr(
-                sys,
-                "_runtime_original_modules_keys",
-                None,
-            )
-            if original_modules is not None:
-                for name in list(sys.modules):
-                    if (
-                        name not in original_modules
-                        and not _is_runtime_module(name)
-                    ):
-                        del sys.modules[name]
-
-            for key in tuple(_managed_environment_keys):
-                if key in _runtime_original_environment:
-                    os.environ[key] = _runtime_original_environment[key]
-                else:
-                    os.environ.pop(key, None)
-            _managed_environment_keys.clear()
+            sys.path[:] = _runtime_base_sys_path
+            for context in tuple(_runtime_contexts):
+                for name in tuple(context.modules):
+                    sys.modules.pop(name, None)
+            for name in tuple(_runtime_shared_modules):
+                sys.modules.pop(name, None)
+            _runtime_shared_modules.clear()
+            _runtime_shared_package_names.clear()
+            sys.modules.update(_runtime_base_modules)
+            _restore_process_environment(_runtime_original_environment)
+            _runtime_contexts.clear()
     except BaseException:
         traceback.print_exc()
         result = 1
