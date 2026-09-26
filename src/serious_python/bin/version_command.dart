@@ -56,8 +56,7 @@ class VersionCommand extends Command {
     stdout.writeln("Supported Python versions:");
     // Sort descending so the default + newest stable is on top, matching the
     // ordering convention used by `flet --version`.
-    final keys = pythonReleases.keys.toList()
-      ..sort((a, b) => b.compareTo(a));
+    final keys = pythonReleases.keys.toList()..sort((a, b) => b.compareTo(a));
     for (final k in keys) {
       final r = pythonReleases[k]!;
       final markers = <String>[];

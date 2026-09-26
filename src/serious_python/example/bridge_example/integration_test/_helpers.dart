@@ -109,8 +109,8 @@ class MemSnapshot {
 }
 
 Future<MemSnapshot> memSnapshot(app.BridgeExampleHandle handle) async {
-  final fut = waitControlEvent(handle, 'mem',
-      timeout: const Duration(seconds: 10));
+  final fut =
+      waitControlEvent(handle, 'mem', timeout: const Duration(seconds: 10));
   handle.sendControl({'op': 'mem'});
   final msg = await fut;
   return MemSnapshot(

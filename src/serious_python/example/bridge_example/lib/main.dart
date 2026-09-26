@@ -69,8 +69,7 @@ void main() {
   // testable handle is available immediately.
   final control = PythonBridge();
   final echo = PythonBridge();
-  BridgeExampleHandle._instance =
-      BridgeExampleHandle._(control, echo);
+  BridgeExampleHandle._instance = BridgeExampleHandle._(control, echo);
 
   // Fire-and-forget: Python's main.py blocks forever waiting for messages.
   // Awaiting SeriousPython.run() would deadlock the UI.
