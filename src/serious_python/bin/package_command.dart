@@ -8,8 +8,8 @@ import 'package:glob/glob.dart';
 import 'package:glob/list_local_fs.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as path;
-import 'package:shelf/shelf.dart';
 import 'package:serious_python/src/python_versions.dart';
+import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 
 import 'macos_utils.dart' as macos_utils;
@@ -164,7 +164,8 @@ class PackageCommand extends Command {
             "Output asset path, relative to pubspec.yaml, to package Python program into.");
     argParser.addMultiOption('exclude',
         help:
-            "List of relative paths to exclude from app package, e.g. \"assets,build\".");
+            "Relative path to exclude from app package, e.g. \"build\"; can be used multiple times.",
+        splitCommas: false);
     argParser.addFlag("skip-site-packages",
         help: "Skip installation of site packages.", negatable: false);
     argParser.addFlag("compile-app",
@@ -180,12 +181,16 @@ class PackageCommand extends Command {
         help: "Cleanup app from unneccessary files and directories.",
         negatable: false);
     argParser.addMultiOption('cleanup-app-files',
-        help: "List of globs to delete extra app files and directories.");
+        help:
+            "Glob to delete extra app files and directories; can be used multiple times.",
+        splitCommas: false);
     argParser.addFlag("cleanup-packages",
         help: "Cleanup packages from unneccessary files and directories.",
         negatable: false);
     argParser.addMultiOption('cleanup-package-files',
-        help: "List of globs to delete extra packages files and directories.");
+        help:
+            "Glob to delete extra packages files and directories; can be used multiple times.",
+        splitCommas: false);
     argParser.addFlag("verbose", help: "Verbose output.", negatable: false);
   }
 
@@ -442,7 +447,15 @@ class PackageCommand extends Command {
             stdout.writeln(
                 "Installing $requirements with pip command to $sitePackagesDir");
 
-            List<String> pipArgs = ["--disable-pip-version-check"];
+            List<String> pipArgs = [
+              "--disable-pip-version-check",
+              "--timeout",
+              "30",
+              "--retries",
+              "3",
+              // Prevent pip from prompting and hanging for input.
+              "--no-input",
+            ];
 
             if (isMobile || isWeb) {
               pipArgs.addAll(["--only-binary", ":all:"]);
@@ -592,7 +605,8 @@ class PackageCommand extends Command {
             "explicit --asset must be provided for legacy asset packaging.");
       }
     } catch (e) {
-      stdout.writeln("Error: $e");
+      stderr.writeln("Error: $e");
+      exitCode = 1;
     } finally {
       if (tempDir != null && await tempDir.exists()) {
         stdout.writeln("Deleting temp directory");

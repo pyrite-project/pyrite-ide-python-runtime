@@ -24,9 +24,9 @@ is specified.
 
 | Short | CPython runtime | Pyodide (web) | Pyodide wheel platform tag       |
 | ----- | --------------- | ------------- | -------------------------------- |
-| 3.12  | 3.12.13         | 0.27.7        | `pyodide-2024.0-wasm32`           |
-| 3.13  | 3.13.14         | 0.29.4        | `pyemscripten-2025.0-wasm32`      |
-| 3.14  | 3.14.6          | 314.0.0       | `pyemscripten-2026.0-wasm32`      |
+| 3.12  | 3.12.14         | 0.27.7        | `pyodide-2024.0-wasm32`           |
+| 3.13  | 3.13.15         | 0.29.4        | `pyemscripten-2025.0-wasm32`      |
+| 3.14  | 3.14.7          | 314.0.6       | `pyemscripten-2026.0-wasm32`      |
 
 The default is the latest stable row (currently **3.14**) when neither
 `--python-version` nor `SERIOUS_PYTHON_VERSION` is set. When running through
@@ -192,6 +192,46 @@ dart run serious_python:main package app/src -p iOS -r -r -r app/src/requirement
 
 For the **web** (`Emscripten`) target there is no `SERIOUS_PYTHON_APP`; the app and its `__pypackages__` are zipped into the `app/app.zip` asset instead — make sure it's added to `pubspec.yaml`.
 
+On **iOS**, also set `SERIOUS_PYTHON_BUNDLE_ID` to your app's bundle identifier:
+
+```
+export SERIOUS_PYTHON_BUNDLE_ID=com.example.myapp
+```
+
+Each native extension in your app's own dependencies ships as its own embedded
+framework, and this namespaces their `CFBundleIdentifier`s under your app
+(`com.example.myapp.-numpy-core-multiarray`) instead of a shared `org.python.*`
+default — matching what CPython's own iOS support does. Set it in **both** places
+`SERIOUS_PYTHON_SITE_PACKAGES` is set (the `package` command and the later `flutter
+build`), since the CocoaPods `prepare_command` re-runs the darwin sync. If unset —
+or if the value isn't a valid bundle identifier — the `org.python.*` defaults are
+kept and a warning is printed. `flet build` sets this for you.
+
+This applies **only** to frameworks built here from your wheels. `Python.xcframework`,
+`dart_bridge.xcframework`, and the stdlib extension frameworks arrive pre-built and
+**signed by their publisher**, with stable `dev.flet.python.*` / `dev.flet.dartbridge`
+identifiers assigned upstream. serious_python stages those byte-for-byte and never
+rewrites anything inside them — see [SDK-origin signatures](#sdk-origin-signatures)
+below.
+
+#### Excluding and cleaning up files
+
+Exclude files and directories from the app package with `--exclude`. Each value is a path relative to the app directory, matched exactly (no globs); a matching directory is excluded with everything in it. Pass the option once per path:
+
+```
+dart run serious_python:main package app/src -p Darwin \
+    --exclude build --exclude tests --exclude src/.venv
+```
+
+`--cleanup-app` and `--cleanup-packages` (or `--cleanup` for both) delete known junk files (C sources and headers, type stubs, `__pycache__`, and so on) from the app and from the installed packages. Add your own globs with `--cleanup-app-files` and `--cleanup-package-files`, once per glob; they are only applied together with the matching cleanup flag:
+
+```
+dart run serious_python:main package app/src -p Android --cleanup-packages \
+    --cleanup-package-files '**/{tests,docs}' --cleanup-package-files '**.md'
+```
+
+> `--exclude`, `--cleanup-app-files` and `--cleanup-package-files` stopped splitting their values on commas in **5.0.0**, so paths containing `,` and brace globs such as `**/{tests,docs}` can be expressed. The comma-separated form (`--exclude build,tests`) now matches a single path named `build,tests`; pass each value as its own option instead.
+
 ## Python app structure
 
 By default, embedded Python program is run in a separate thread, to avoid UI blocking. Your Flutter app is not supposed to directly call Python functions or modules, but instead it should communicate via some API provided by a Python app, such as: REST API, sockets, SQLite database, files, etc.
@@ -234,7 +274,7 @@ The on-disk layout differs per platform, mostly because each OS has different ru
 
 ### Your app program (all platforms)
 
-`package` copies your Python sources into a temp dir (honoring `--exclude` globs, optionally compiling to `.pyc` with `--compile-app`). For **native** platforms it stages them to `SERIOUS_PYTHON_APP`, and the platform build drops them **unpacked into the bundle** next to the stdlib/site-packages — `<resourcePath>/app` (iOS/macOS), `<exe-dir>/app` (Windows/Linux). There's no first-launch extraction; `SeriousPython.prepareApp()` just returns that path. On **Android** the sources are zipped into a *stored* `app.zip` asset and unpacked once (version-keyed by your app version) to `<application-support>/flet/app` on the first launch after an install/update. On the **web** they're zipped into `app/app.zip` and loaded by Pyodide. Your app dir is placed first on `sys.path`; a sibling `__pypackages__/` is also added (so you can vendor pure-Python deps next to your code). At run time the current directory is set to a writable `<application-support>/data` (the app dir itself is read-only).
+`package` copies your Python sources into a temp dir (skipping `--exclude` paths, optionally compiling to `.pyc` with `--compile-app`). For **native** platforms it stages them to `SERIOUS_PYTHON_APP`, and the platform build drops them **unpacked into the bundle** next to the stdlib/site-packages — `<resourcePath>/app` (iOS/macOS), `<exe-dir>/app` (Windows/Linux). There's no first-launch extraction; `SeriousPython.prepareApp()` just returns that path. On **Android** the sources are zipped into a *stored* `app.zip` asset and unpacked once (version-keyed by your app version) to `<application-support>/flet/app` on the first launch after an install/update. On the **web** they're zipped into `app/app.zip` and loaded by Pyodide. Your app dir is placed first on `sys.path`; a sibling `__pypackages__/` is also added (so you can vendor pure-Python deps next to your code). At run time the current directory is set to a writable `<application-support>/data` (the app dir itself is read-only).
 
 `pip install` output goes to `build/site-packages` by default (override with the `SERIOUS_PYTHON_SITE_PACKAGES` env var). For mobile, packages are installed **per architecture** (a `sitecustomize.py` shim spoofs the wheel platform tag so the correct mobile wheels resolve), then merged or split per platform as shown above.
 
@@ -248,6 +288,68 @@ The on-disk layout differs per platform, mostly because each OS has different ru
 ### iOS / macOS specifics
 
 The CPython runtime, stdlib, and (on iOS) native extensions are bundled into `serious_python_darwin.framework` as resources. On **iOS**, the App Store forbids loose `.dylib`s, so every native extension `.so` is repackaged into a signed `.framework` inside an `.xcframework`, with a `.fwork` text marker left at the module's import path; CPython's `AppleFrameworkLoader` reads the marker and loads the framework binary. On **macOS**, native extensions stay as plain `.so`, merged into universal (`arm64`+`x86_64`) binaries at package time. `PYTHONHOME` is the framework's resource path; `sys.path` includes `<resources>/site-packages`, `<resources>/stdlib`, and `<resources>/stdlib/lib-dynload`.
+
+#### SDK-origin signatures
+
+Xcode records, for every `.xcframework` your app links against, whether **the
+publisher** signed it and whether that signature carried a secure timestamp. The
+result is written into the IPA as `Signatures/<name>.xcframework-ios.signature`,
+and Apple's App Store scan reports a missing one as `ITMS-91065: Missing signature`.
+
+This is **separate from your app's own signature.** Xcode re-signs every embedded
+framework with your Apple Distribution identity at embed time and again at
+`exportArchive`; that has no effect on the SDK-origin receipt. Equally, editing a
+single file inside an `.xcframework` — even one `Info.plist` key — invalidates the
+publisher's signature and turns the receipt back into `signed = false`.
+
+Both layers are signed: each slice's inner `.framework` as well as the outer
+`.xcframework`, in that order. Signing only the outer bundle yields a receipt
+reading `signed = true` but `isSecureTimestamp = false`.
+
+So serious_python treats `Python.xcframework`, `dart_bridge.xcframework`, and the
+stdlib extension frameworks as **immutable** once downloaded. They are copied
+verbatim at every staging step, and each step re-checks a digest manifest recorded
+at extraction time, so a reintroduced mutation fails the build instead of surfacing
+as an App Store rejection weeks later.
+
+`SERIOUS_PYTHON_VERIFY_PROVIDER_SIGNATURES` controls what happens when a publisher
+signature is missing or invalid:
+
+| value | behaviour |
+| :--- | :--- |
+| `warn` (default) | report and continue — lets you pin an older, pre-signing `python-build` / `dart-bridge` release |
+| `require` | fail the build; use this for App Store submissions |
+| `off` | skip the signature checks |
+
+Set `SERIOUS_PYTHON_EXPECTED_TEAM_ID` to additionally require a specific Apple
+Team ID on those signatures. The digest-manifest checks always run and are always
+fatal — they cover this package's own behaviour, not the artifacts you pinned.
+
+#### iOS packaging path: use SwiftPM
+
+The **Swift Package Manager** path declares the publisher's `.xcframework`s as
+`binaryTarget`s, which is what makes Xcode emit the `Signatures/` receipts above.
+
+The CocoaPods path copies the *inner* `.framework` bundles out of the stdlib
+xcframeworks in a `Pods-Runner-frameworks.sh` script phase, which discards the
+outer-XCFramework provenance even when the source is correctly signed. It still
+produces a working app, but it cannot produce complete SDK-origin receipts. **Use
+the SwiftPM path for App Store submissions** until that path is replaced with real
+vendored XCFramework declarations.
+
+#### macOS native module signatures
+
+On macOS, the native modules under `stdlib/`, `site-packages/` and `app/` ship as
+plain `.so`/`.dylib` files, which Xcode's distribution signing (the Organizer or
+`xcodebuild -exportArchive`) re-signs with your certificate along with the rest of
+the app. A module carrying the signature the linker gave it comes out of that
+step with a designated requirement naming a different identifier than its new
+signature: codesign does not carry a linker signature's identifier over, but Xcode
+can build the requirement from it. App Store Connect rejects such an upload with
+error 90238 ("does not satisfy its designated Requirement"). The macOS build
+therefore replaces linker signatures with regular ad-hoc ones while staging these
+trees. The `SERIOUS_PYTHON_SITE_PACKAGES` and `SERIOUS_PYTHON_APP` directories
+themselves are left unchanged.
 
 ### Linux / Windows specifics
 

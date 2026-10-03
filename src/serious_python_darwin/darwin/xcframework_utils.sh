@@ -105,3 +105,166 @@ create_xcframework_from_dylibs() {
     popd >/dev/null
     rm -rf "${dylib_tmp_dir}" >/dev/null
 }
+
+# Namespace LOCALLY BUILT frameworks' CFBundleIdentifiers under the host app's
+# bundle id, mirroring what CPython's own iOS support does when it converts a
+# .so into a framework (Platforms/Apple/testbed/Python.xcframework/build/utils.sh):
+#
+#   FRAMEWORK_BUNDLE_ID=$(echo $PRODUCT_BUNDLE_IDENTIFIER.$FULL_MODULE_NAME | tr "_" "-")
+#
+# SCOPE -- read this before adding a call site.
+# This may only be pointed at frameworks create_xcframework_from_dylibs built
+# moments earlier from the app's own site-packages. It must NEVER be pointed at a
+# provider-built artifact (Python.xcframework, dart_bridge.xcframework, or the
+# stdlib extension frameworks from python-build).
+#
+# It used to be. The reasoning was that a globally-shared `org.python.<module>`
+# identifier on a framework Apple fingerprints as a third-party SDK explained the
+# ITMS-91065 rejection in flet-dev/flet#6724. That hypothesis was wrong, and the
+# fix was actively harmful: rewriting an Info.plist inside a provider XCFramework
+# invalidates the provider's signature, and it is precisely that SDK-origin
+# signature which ITMS-91065 is reporting missing. Xcode records it in the IPA's
+# top-level Signatures/ receipts, separately from -- and unaffected by -- the app's
+# own signature applied at embed and exportArchive.
+#
+# Provider frameworks now arrive with stable, provider-owned `dev.flet.python.*`
+# identifiers assigned upstream in python-build (dart_bridge has always used
+# `dev.flet.dartbridge`), so there is nothing here left to fix.
+#
+# The leading hyphen this produces for underscore-prefixed modules (`_ssl` ->
+# `<app>.-ssl`) is deliberate: it is what keeps `_ssl` distinct from `ssl`, and it
+# is the exact form CPython and BeeWare ship.
+#
+# Must run BEFORE reconcile_framework_install_names, whose ad-hoc re-sign reseals
+# the modified Info.plists.
+#
+# $3 is an optional space-separated list of framework names to leave alone. No
+# current caller passes it; it is kept because the guarantee it encodes -- some
+# names are off limits -- is cheaper to keep than to re-derive.
+rewrite_framework_bundle_ids() {
+    local xcframeworks_dir=$1
+    local bundle_id=${2%.}
+    local skip=" ${3:-} "
+
+    # CFBundleIdentifier allows only [A-Za-z0-9.-], and every dot-separated
+    # component must be non-empty. The bundle id comes from the app's pyproject /
+    # CLI, so validate rather than emit a plist that fails much later at export
+    # with an error naming a framework the developer has never heard of.
+    if ! printf '%s' "$bundle_id" | grep -Eq '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$'; then
+        echo "rewrite_framework_bundle_ids: '$bundle_id' is not a valid bundle identifier;" \
+             "leaving framework identifiers at their org.python.* defaults" >&2
+        return 0
+    fi
+
+    local xcf fw component identifier plist err
+    for xcf in "$xcframeworks_dir"/*.xcframework; do
+        [ -d "$xcf" ] || continue
+        fw=$(basename "$xcf" .xcframework)
+        case "$skip" in *" $fw "*) continue ;; esac
+        # Module names come from whatever wheels the app depends on, so anything
+        # outside the allowed set becomes a hyphen.
+        component=$(printf '%s' "$fw" | tr '_' '-' | sed 's/[^A-Za-z0-9.-]/-/g')
+        identifier="$bundle_id.$component"
+        for plist in "$xcf"/*/"$fw.framework/Info.plist"; do
+            [ -f "$plist" ] || continue
+            if ! err=$(plutil -replace CFBundleIdentifier -string "$identifier" "$plist" 2>&1); then
+                echo "rewrite_framework_bundle_ids: plutil failed for $plist: $err" >&2
+                return 1
+            fi
+        done
+    done
+}
+
+# Reconcile install names across the newly-created site-package frameworks.
+#
+# create_xcframework_from_dylibs renames each lib to a framework named by its
+# dotted relative path (opt/lib/libarrow.dylib -> opt.lib.libarrow.framework/
+# opt.lib.libarrow), but leaves the Mach-O install-id and every interdependent
+# @rpath reference at their ORIGINAL bare names (e.g. @rpath/libarrow.dylib):
+# it only rewrites the install-id, and only for ext=so. dyld links every one of
+# these frameworks at app launch (each is a Package.swift binaryTarget the
+# plugin depends on), so a bare @rpath/libarrow.dylib resolves to
+# Frameworks/libarrow.dylib -- which does not exist -- and the app crashes
+# BEFORE Python starts. See serious-python #223.
+#
+# This pass makes the install names match the framework layout:
+#   1. set every framework binary's own install-id to @rpath/<fw>.framework/<fw>
+#   2. rewrite every dep that pointed at a sibling's OLD id to that sibling's
+#      framework path, so interdependent libs (libarrow_python -> libarrow, or a
+#      C-extension -> its bundled .dylib) resolve at launch.
+# Only the frameworks created from site-packages are touched; the Python /
+# stdlib xcframeworks (passed as $2) are already correct and left untouched.
+reconcile_framework_install_names() {
+    local xcframeworks_dir=$1
+    local exclude_dir=$2
+
+    local -a map_old=()
+    local -a map_new=()
+
+    # Pass 1: set each framework's own install-id to @rpath/<fw>.framework/<fw>,
+    # and record old-id -> new-id for the dep rewrite below. Read the old id from
+    # EVERY slice, not just the first: a lib whose slices carry divergent install
+    # names (e.g. an upstream build that baked an arch-specific absolute path
+    # instead of an @rpath id) would otherwise leave the other slices' deps
+    # unrewritten. Distinct old ids all map to the same new id.
+    local xcf fw newid bin oldid raw err j found
+    for xcf in "$xcframeworks_dir"/*.xcframework; do
+        [ -d "$xcf" ] || continue
+        fw=$(basename "$xcf" .xcframework)
+        [ -n "$exclude_dir" ] && [ -e "$exclude_dir/$fw.xcframework" ] && continue
+        newid="@rpath/$fw.framework/$fw"
+        for bin in "$xcf"/*/"$fw.framework/$fw"; do
+            [ -f "$bin" ] || continue
+            # Buffer otool output before filtering: piping otool straight into
+            # `head -1` lets head close the pipe early, and the SIGPIPE race
+            # intermittently drops the first read (empty oldid).
+            raw=$(otool -D "$bin" 2>/dev/null)
+            oldid=$(printf '%s\n' "$raw" | grep -v ':$' | grep -vi 'Architectures in' | head -1 | sed 's/^[[:space:]]*//')
+            # -id must succeed; a failure means the binary is unwritable/corrupt
+            # and the app would crash at launch, so surface it instead of hiding
+            # it behind `|| true` (stderr is captured and only printed on error,
+            # to keep the expected "will invalidate the code signature" warning
+            # off the build log).
+            if ! err=$(install_name_tool -id "$newid" "$bin" 2>&1); then
+                echo "reconcile_framework_install_names: install_name_tool -id failed for $bin: $err" >&2
+                return 1
+            fi
+            if [ -n "$oldid" ] && [ "$oldid" != "$newid" ]; then
+                found=0
+                for j in ${map_old[@]+"${map_old[@]}"}; do
+                    [ "$j" = "$oldid" ] && { found=1; break; }
+                done
+                [ "$found" -eq 0 ] && { map_old+=("$oldid"); map_new+=("$newid"); }
+            fi
+        done
+    done
+
+    # Pass 2: rewrite each binary's deps that point at a sibling's old id to that
+    # sibling's framework path, then re-sign (install_name_tool invalidates the
+    # ad-hoc signature). `install_name_tool -change` is a no-op returning 0 when
+    # the dep is absent, so a NON-zero rc means a dep that IS present could not be
+    # rewritten -- usually no Mach-O header space to grow the load command. That
+    # is fatal: it would leave a bare @rpath ref and reproduce the exact launch
+    # crash this pass exists to prevent, so fail the build rather than ship it.
+    local i n=${#map_old[@]}
+    for xcf in "$xcframeworks_dir"/*.xcframework; do
+        [ -d "$xcf" ] || continue
+        fw=$(basename "$xcf" .xcframework)
+        [ -n "$exclude_dir" ] && [ -e "$exclude_dir/$fw.xcframework" ] && continue
+        for bin in "$xcf"/*/"$fw.framework/$fw"; do
+            [ -f "$bin" ] || continue
+            i=0
+            while [ $i -lt $n ]; do
+                if ! err=$(install_name_tool -change "${map_old[$i]}" "${map_new[$i]}" "$bin" 2>&1); then
+                    echo "reconcile_framework_install_names: install_name_tool -change '${map_old[$i]}' -> '${map_new[$i]}' failed for $bin (no Mach-O header space?): $err" >&2
+                    return 1
+                fi
+                i=$((i+1))
+            done
+            if ! err=$(codesign --force --sign - "$bin" 2>&1); then
+                echo "reconcile_framework_install_names: codesign failed for $bin: $err" >&2
+                return 1
+            fi
+        done
+    done
+}

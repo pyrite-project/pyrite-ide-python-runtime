@@ -2,6 +2,59 @@
 
 * Always load the release `dart_bridge.dll` on Windows so Flutter Debug builds use a CPython ABI compatible with standard native extension wheels.
 
+## 5.0.0
+
+* Align with the serious_python **5.0.0** release ([#253](https://github.com/flet-dev/serious-python/pull/253)).
+
+## 4.7.2
+
+* Align with the serious_python **4.7.2** release ([#252](https://github.com/flet-dev/serious-python/pull/252)).
+
+## 4.7.1
+
+* Align with the serious_python **4.7.1** release.
+
+## 4.7.0
+
+* **`DartBridge.hardExit(exitCode)` / `DartBridge.canHardExit`**, binding `serious_python_hard_exit` from `dart_bridge` 1.9.0. `dart:io`'s `exit()` runs the normal C teardown, which destroys the C++ statics inside every loaded CPython extension module while the interpreter thread may still be running inside one of them; `hardExit` skips it. The symbol is resolved through the existing soft lookup, so an app built against an older `libdart_bridge` still loads, `canHardExit` is `false`, and the caller falls back to `exit()`. See the `serious_python` 4.7.0 notes.
+* Re-pins the bundled python-build snapshot to **20260908** and `dart_bridge` to **1.9.0**.
+
+## 4.6.0
+
+* Version bump aligning with the `serious_python_*` 4.6.0 release.
+
+## 4.5.1
+
+* Version bump aligning with the `serious_python_*` 4.5.1 release.
+
+## 4.5.0
+
+* Version bump aligning with the `serious_python_*` 4.5.0 release.
+
+## 4.4.2
+
+* Version bump aligning with the `serious_python_*` 4.4.2 release.
+
+## 4.4.1
+
+* Version bump aligning with the `serious_python_*` 4.4.1 release.
+
+## 4.4.0
+
+* Version bump aligning with the `serious_python_*` 4.4.0 release.
+
+## 4.3.6
+
+* Version bump aligning with the `serious_python_*` 4.3.6 release (Windows UTF-8 startup fix via `dart_bridge` 1.5.1). No interface changes.
+
+## 4.3.4
+
+* Version bump aligning with the `serious_python_*` 4.3.4 release (desktop `_pyrepl` fix + Android `flet debug` cache fix). No interface changes.
+
+## 4.3.3
+
+* Version bump aligning with the `serious_python_*` 4.3.3 release.
+
 ## 4.3.2
 
 * Version bump aligning with the `serious_python_*` 4.3.2 release.

@@ -57,6 +57,12 @@ if [ ! -d "$dist" ] || [ "$(cat "$marker" 2>/dev/null)" != "$pb_id" ]; then
     echo "$pb_id" > "$marker"
 fi
 
+# ---- stdlib native module signatures ----------------------------------------
+# Outside the extraction guard, so an already-extracted dist is covered as well.
+# The provider xcframeworks are not touched.
+. "$script_dir/linker_signatures.sh"
+replace_linker_signatures "$dist/stdlib" || exit 1
+
 # ---- flet-dev/dart-bridge (xcframework, same archive for macOS + iOS) -----
 # Separate cache guard so a stale $dist from before this change still picks
 # up the new artifact on first re-prepare.
@@ -76,3 +82,16 @@ if [ ! -d "$dist/xcframeworks/dart_bridge.xcframework" ] || [ "$(cat "$db_marker
     unzip -q "$dart_bridge_path" -d "$dist/xcframeworks/"
     echo "$dart_bridge_version" > "$db_marker"
 fi
+
+# ---- provider provenance ---------------------------------------------------
+# Runs last, and in particular AFTER the Python.app removal above. That removal
+# is a legacy safety net -- python-build has excluded Python.app from the shipped
+# framework since the exclude list gained it, so on any current artifact it
+# matches nothing -- but it does delete a file from inside a provider bundle, so
+# it has to happen before the signature check and the digest snapshot rather
+# than after. Nothing downstream of this point may modify these bundles: editing
+# any file inside a signed XCFramework destroys the SDK-origin signature that the
+# IPA's Signatures/ receipts report on.
+. "$script_dir/xcframework_verify.sh"
+spv_verify_provider "$dist/xcframeworks" || exit 1
+spv_manifest_record "$dist/.provider-manifests/xcframeworks.sha256" "$dist/xcframeworks"

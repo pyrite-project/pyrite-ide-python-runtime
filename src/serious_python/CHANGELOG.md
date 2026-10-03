@@ -1,8 +1,88 @@
+## 5.0.0
+
+* **Breaking (`package` command):** `--exclude`, `--cleanup-app-files` and `--cleanup-package-files` no longer split their values on commas, so paths containing `,` and brace globs such as `**/{tests,docs}` can be passed. Previously a hidden file named `.a,main.py` passed to `--exclude` became two exclusions, dropping `main.py`, and `**/{tests,docs}` was split into two broken globs. Pass each value as its own option: `--exclude build --exclude tests` instead of `--exclude build,tests`. A comma-separated value is now matched as a single path, so an unmigrated command packages the files it used to exclude without failing. The Dart API and runtime are unchanged. `flet build` pins serious_python exactly, so existing Flet releases are unaffected ([#253](https://github.com/flet-dev/serious-python/pull/253), [flet#6839](https://github.com/flet-dev/flet/issues/6839)).
+
+## 4.7.2
+
+* **Packaging:** report packaging exceptions on stderr and exit with status `1`, so CI and `flet build` stop on failure while temporary files are still cleaned up ([#252](https://github.com/flet-dev/serious-python/pull/252)).
+* **macOS:** fix App Store Connect error `90238` ("does not satisfy its designated Requirement") for bundled native modules after Xcode distribution signing ([#250](https://github.com/flet-dev/serious-python/issues/250), [#251](https://github.com/flet-dev/serious-python/pull/251)). See `serious_python_darwin` 4.7.2.
+* **iOS/macOS (CocoaPods):** fail `pod install` when a Python runtime preparation script fails, preventing builds from continuing with an incomplete runtime. See `serious_python_darwin` 4.7.2. ([#251](https://github.com/flet-dev/serious-python/pull/251))
+
+## 4.7.1
+
+* Fix macOS crashes during native scientific imports and NumPy operations by giving the asynchronous Python worker at least **8 MiB** of stack space, via `dart_bridge` 1.10.0. ([dart-bridge#21](https://github.com/flet-dev/dart-bridge/pull/21), [#85](https://github.com/flet-dev/serious-python/issues/85))
+* Update Pyodide to **0.27.8 / 0.29.5 / 314.0.7** for Python **3.12 / 3.13 / 3.14**, respectively. Wheel platform tags are unchanged. ([python-build#42](https://github.com/flet-dev/python-build/pull/42))
+* Update the python-build snapshot to **20260921** and `dart_bridge` to **1.10.0**. CPython versions remain **3.12.14 / 3.13.15 / 3.14.7**. ([python-build#42](https://github.com/flet-dev/python-build/pull/42))
+
+## 4.7.0
+
+* **`DartBridge.hardExit(exitCode)`: terminate without running process teardown.** `dart:io`'s `exit()` runs the normal C teardown, which destroys the C++ statics inside every loaded CPython extension module. The interpreter lives on a detached thread that may still be running, so that teardown can fault it, giving a `SIGSEGV` on exit from an app that had already finished its work. `hardExit` skips it. Guard with `DartBridge.canHardExit`, which is `false` against a pre-1.9.0 `libdart_bridge` (the symbol is resolved softly, like `isPythonInitialized` and `signalDartSession`); `hardExit` is then a no-op and the caller should fall back to `exit()`.
+* Bundled python-build snapshot re-pinned to [20260908](https://github.com/flet-dev/python-build/releases/tag/20260908) (`dart_bridge` **1.8.0 -> 1.9.0**), which is what carries the new `serious_python_hard_exit` export. No CPython or Pyodide versions change; the release exists to publish the updated manifest.
+
+## 4.6.0
+
+* **The bundled CPython runtimes move to 3.12.14 / 3.13.15 / 3.14.7** (from 3.12.13 / 3.13.14 / 3.14.6) — the first Python version move since 4.3.x; every prior 4.4/4.5 release re-pinned python-build without changing a Python version. All three are security releases: they fix a quadratic-complexity DoS in incremental `html.parser.HTMLParser` parsing ([gh-153030](https://github.com/python/cpython/issues/153030)) and quadratic behaviour in `xml.etree.ElementTree` XPath index predicates ([gh-152674](https://github.com/python/cpython/issues/152674)), among others.
+* **3.12 additionally gets the libexpat CVE fix; 3.13 and 3.14 do not yet.** 3.12.14 (released 2026-08-12) bundles **libexpat 2.8.3** for [CVE-2026-72522](https://github.com/python/cpython/issues/155558); 3.13.15 and 3.14.7 (both 2026-08-05) predate it and still bundle **2.8.2** — verified in the runtimes' own `Modules/expat/expat.h`, not inferred from release notes. Relevant only if your app parses untrusted XML through `pyexpat` / `xml.etree` / `xml.sax`; upstream will pick it up in the next 3.13/3.14 micro.
+* **Pyodide (web) for 3.14: 314.0.3 → 314.0.6.** 3.13 (**0.29.4**) and 3.12 (**0.27.7**) are unchanged — each is already the newest release on its line.
+* Bundled python-build snapshot re-pinned to **20260902** (`dart_bridge` **1.7.1 → 1.8.0**).
+* **Packaging:** `pip install` no longer hangs when an index answers `401` — an authenticating mirror or proxy. pip prompted for credentials on a stdin nothing could answer, and wrote the prompt without a newline so callers never displayed it; the install blocked with `Looking in indexes: ...` as its last output, which `flet build` showed as a frozen `Packaging Python app...`. pip now runs with `--no-input` and bounded `--timeout`/`--retries`. See flet-dev/flet#5989, flet-dev/flet#5013 and flet-dev/flet#5507.
+
+## 4.5.1
+
+* **iOS/macOS:** the bundled `Python`, `dart_bridge` and stdlib extension XCFrameworks are now signed on both layers — each slice's inner `.framework` as well as the outer `.xcframework`. 4.5.0 signed only the outer bundle. Note this did **not** change `isSecureTimestamp`, which still reports false — that field appears not to be reachable by signing; `signed`, which `ITMS-91065` names, is true. See `serious_python_darwin` 4.5.1.
+* Packaging now verifies both layers, so an unsigned slice fails the build instead of surfacing in an App Store submission. Set `SERIOUS_PYTHON_VERIFY_PROVIDER_SIGNATURES=require` for release builds.
+* Bundled python-build snapshot re-pinned to **20260730** (`dart_bridge` **1.7.0 → 1.7.1**). No Python version moved — **3.12.13 / 3.13.14 / 3.14.6** and Pyodide are unchanged from 20260729.
+
+## 4.5.0
+
+* **iOS/macOS:** the pre-built `Python`, `dart_bridge` and stdlib extension XCFrameworks are now staged byte-for-byte and never modified. `SERIOUS_PYTHON_BUNDLE_ID` now namespaces only the frameworks built from *your* app's wheels; the pre-built ones keep the stable `dev.flet.*` identifiers their publisher assigned.
+* **This corrects 4.4.2.** Rewriting those identifiers was a hypothesis for the `ITMS-91065: Missing signature` App Store rejection (flet-dev/flet#6724) and it was wrong — the rejection reports on the publisher's signature of each XCFramework, which Xcode records in the IPA separately from your app's own signature, and the identifier rewrite destroyed it. See `serious_python_darwin` for the full explanation.
+* **iOS:** use the **Swift Package Manager** packaging path for App Store submissions. The CocoaPods path copies inner `.framework` bundles and cannot produce the SDK-origin signature receipts Apple's scan looks for; it now warns during the build.
+* New `SERIOUS_PYTHON_VERIFY_PROVIDER_SIGNATURES` (`warn` default / `require` / `off`) and `SERIOUS_PYTHON_EXPECTED_TEAM_ID` env vars verify those publisher signatures during packaging. Set `require` for release builds.
+* Bundled python-build snapshot re-pinned to **20260729** (`dart_bridge` **1.6.1 → 1.7.0**). No Python version moved — **3.12.13 / 3.13.14 / 3.14.6** and Pyodide are unchanged from 20260727 — but every Apple XCFramework in that release is now signed by the Flet publishing team with a secure timestamp. See `serious_python_darwin` 4.5.0.
+
+## 4.4.2
+
+* **iOS:** new `SERIOUS_PYTHON_BUNDLE_ID` env var namespaces the generated frameworks' bundle identifiers under your app (`com.example.myapp.-ssl`) instead of a shared `org.python.*` default identical in every app built with serious_python. `flet build` sets it for you; set it yourself for a manual two-step build, in both places you set `SERIOUS_PYTHON_SITE_PACKAGES`.
+* **iOS:** the bundled Python frameworks (`_ssl`, `_hashlib` and every other native extension) now carry the build-provenance keys Xcode stamps into a real framework's `Info.plist`, instead of a minimal hand-written one.
+* Both are hypotheses under test for the `ITMS-91065: Missing signature` App Store rejection in flet-dev/flet#6724 — neither is a confirmed fix. Only new App Store submissions are affected by that rejection; existing published apps are not. See `serious_python_darwin` 4.4.2.
+* Bundled python-build snapshot re-pinned to **20260727**. No versions moved — Python (**3.12.13 / 3.13.14 / 3.14.6**), Pyodide, and `dart_bridge` **1.6.1** are unchanged from 20260726.
+
+## 4.4.1
+
+* **iOS:** the bundled `_ssl` and `_hashlib` frameworks now ship OpenSSL's official privacy manifest instead of an incomplete stub, correcting what they declare under Apple's third-party SDK requirements. This is a correctness fix and is *not* expected to resolve the `ITMS-91065: Missing signature` App Store rejection reported in flet-dev/flet#6724, which remains under investigation. See `serious_python_darwin` 4.4.1.
+* Bundled python-build snapshot re-pinned to **20260726**. No versions moved — Python (**3.12.13 / 3.13.14 / 3.14.6**), Pyodide, and `dart_bridge` **1.6.1** are unchanged from 20260725.
+
+## 4.4.0
+
+* **iOS/macOS:** fix built iOS apps crashing at startup with `Failed to lookup symbol 'serious_python_run'`. `dart_bridge` now ships as a dynamic framework, so the FFI entry points Dart and Python resolve via `dlsym` stay exported; previously it was static-linked into the app executable, which exports nothing. Release/device builds only. See `serious_python_darwin` 4.4.0.
+* Bundled python-build snapshot re-pinned to **20260725** (`dart_bridge` **1.5.1 → 1.6.1**, which carries the dynamic-framework change above; Pyodide 3.14 **314.0.2 → 314.0.3**). Python versions (**3.12.13 / 3.13.14 / 3.14.6**) are unchanged.
+
+## 4.3.6
+
+* **Android:** PEP 734 subinterpreters (Python 3.14's `concurrent.interpreters` / `InterpreterPoolExecutor`) now work in built apps. Previously the main interpreter could import them, but every *subinterpreter* failed to import any relocated C extension (`ModuleNotFoundError: _struct` / `_interpqueues` / ...) — which broke the whole feature (its cross-interpreter transport pickles → `_struct`, and its queues need `_interpqueues`). The native-module finder lives on `sys.meta_path`, which is per-interpreter, and was installed only in the main interpreter. See `serious_python_android` 4.3.6.
+* **Windows:** fix startup with non-ASCII app paths or environment values — Dart FFI strings (UTF-8) are now converted to UTF-16 before being passed to the Windows CRT, so paths/env values are no longer corrupted through the process ANSI code page, and Python UTF-8 mode is enabled before `Py_Initialize()`. See `serious_python_windows` 4.3.6 and flet-dev/flet#6641.
+* Bundled python-build snapshot re-pinned to **20260720** (`dart_bridge` **1.5.0 → 1.5.1**, which carries the Windows fix above). Python versions (**3.12.13 / 3.13.14 / 3.14.6**) are unchanged.
+
+## 4.3.4
+
+* **Windows/Linux:** desktop apps on Python **3.14** no longer crash at startup with `ModuleNotFoundError: No module named '_pyrepl'` when the app (or a dependency, e.g. NLTK) imports `pydoc` or `pdb`. `_pyrepl` was pruned from the desktop stdlib as a dev-only module, but 3.14's `pydoc`/`pdb` import it at module load. See `serious_python_windows` / `serious_python_linux` 4.3.4 and flet-dev/serious-python#236.
+* Bundled python-build snapshot re-pinned to **20260719**; the only change vs 20260714 is the desktop `_pyrepl` un-prune above. All runtime versions (Python **3.12.13 / 3.13.14 / 3.14.6**, `dart_bridge` **1.5.0**) are unchanged from 4.3.3.
+* **Android:** fix code edits not taking effect under `flet debug android` — the app kept running stale code after a re-run because the on-device extraction cache wasn't invalidated by a same-version reinstall. See `serious_python_android` 4.3.4 and flet-dev/flet#6682.
+
+## 4.3.3
+
+* **Windows:** fix `flet build windows` failing on non-UTF-8 system locales (e.g. Simplified-Chinese Windows, code page **936/GBK**) with `error C2220` (escalated from `warning C4819`) while compiling the Windows plugin — a non-ASCII character in a source comment couldn't be decoded under GBK and the Flutter template's `/WX` made it fatal. The character is removed and the plugin now builds with `/utf-8`. See `serious_python_windows` 4.3.3 and flet-dev/flet#6686.
+* No runtime changes: bundled Python versions (**3.12.13 / 3.13.14 / 3.14.6**) and `dart_bridge` (**1.5.0**) are unchanged from 4.3.2.
+
 ## 4.3.2
 
-* Bump the bundled python-build snapshot to `20260712`, fixing two on-device startup crashes affecting Python **3.13/3.14** apps (3.12 is unaffected). Bundled Python versions (**3.12.13 / 3.13.14 / 3.14.6**) and `dart_bridge` (**1.5.0**) are unchanged from 4.3.1.
+* **iOS:** interdependent bundled dylibs (e.g. pyarrow, llama-cpp-python) no longer crash the app at launch with `dyld: Library not loaded: @rpath/lib<X>.dylib` — the framework install-ids and sibling `@rpath` references are reconciled to the relocated framework paths ([#223](https://github.com/flet-dev/serious-python/issues/223)). See `serious_python_darwin` 4.3.2.
+* **Android:** fix `import <pkg>` yielding an empty module for a package whose `__init__` is itself the native extension (e.g. apsw) — the extension is now resolved from its `<pkg>/__init__.soref` marker. See `serious_python_android` 4.3.2.
+* Bump the bundled python-build snapshot to `20260714`, fixing three on-device crashes. Bundled Python versions (**3.12.13 / 3.13.14 / 3.14.6**) and `dart_bridge` (**1.5.0**) are unchanged from 4.3.1.
 * **Android:** fix 3.13/3.14 apps crashing with `SIGSYS` before any app code runs on x86_64 (and other ABIs with a 32-bit-style `SYS_open`) — mimalloc's raw `open(2)` syscall is forbidden by Android's seccomp policy. See `serious_python_android` 4.3.2.
 * **iOS/Android:** `_pyrepl` is no longer pruned from the mobile stdlib — Python 3.14's `pdb` imports it at module load, so anything importing `pdb` (e.g. pytest's debugging plugin) failed with `ModuleNotFoundError: No module named '_pyrepl'`. See `serious_python_darwin` / `serious_python_android` 4.3.2.
+* **iOS:** `import multiprocessing` (e.g. via scikit-learn/joblib) no longer fails with `ModuleNotFoundError: No module named '_posixshmem'` — the `_posixshmem` extension is now built into the iOS runtimes alongside `_multiprocessing`. See `serious_python_darwin` 4.3.2.
 
 ## 4.3.1
 

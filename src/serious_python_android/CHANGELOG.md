@@ -1,6 +1,62 @@
+## 5.0.0
+
+* Align with the serious_python **5.0.0** release ([#253](https://github.com/flet-dev/serious-python/pull/253)).
+
+## 4.7.2
+
+* Align with the serious_python **4.7.2** release ([#252](https://github.com/flet-dev/serious-python/pull/252)).
+
+## 4.7.1
+
+* Update the python-build snapshot to **20260921** and `dart_bridge` to **1.10.0**. CPython versions remain **3.12.14 / 3.13.15 / 3.14.7**. ([python-build#42](https://github.com/flet-dev/python-build/pull/42))
+
+## 4.7.0
+
+* Re-pins the bundled python-build snapshot to **20260908** and `dart_bridge` to **1.9.0**, whose `libdart_bridge.so` adds the `serious_python_hard_exit` export behind `DartBridge.hardExit`. No CPython versions change from 4.6.0 - **3.12.14 / 3.13.15 / 3.14.7** are unchanged.
+
+## 4.6.0
+
+* **The bundled Android runtimes move to CPython 3.12.14 / 3.13.15 / 3.14.7** (from 3.12.13 / 3.13.14 / 3.14.6). All three are security releases: they fix a quadratic-complexity DoS in incremental `html.parser.HTMLParser` parsing ([gh-153030](https://github.com/python/cpython/issues/153030)) and quadratic behaviour in `xml.etree.ElementTree` XPath index predicates ([gh-152674](https://github.com/python/cpython/issues/152674)), among others. 3.13.15 and 3.14.7 still bundle libexpat **2.8.2**; only 3.12.14 carries **2.8.3** with the [CVE-2026-72522](https://github.com/python/cpython/issues/155558) fix — see the `serious_python` 4.6.0 notes.
+* Re-pins the bundled python-build snapshot to **20260902** and `dart_bridge` to **1.8.0**.
+
+## 4.5.1
+
+* Re-pins the bundled python-build snapshot to **20260730** and `dart_bridge` to **1.7.1**. Both exist to sign the Apple XCFrameworks on both layers (see `serious_python_darwin` 4.5.1); no Python version moved from 20260729 (**3.12.13 / 3.13.14 / 3.14.6**), and nothing about Android changed.
+
+## 4.5.0
+
+* Re-pins the bundled python-build snapshot to **20260729** and `dart_bridge` to **1.7.0**. Both exist to provider-sign the Apple XCFrameworks (see `serious_python_darwin` 4.5.0). Nothing about Android changed: no Python version moved from 20260727 (**3.12.13 / 3.13.14 / 3.14.6**), and `dart_bridge`'s Android `.so`s are byte-identical to 1.6.1 — verified, not assumed.
+
+## 4.4.2
+
+* Re-pins the bundled python-build snapshot to **20260727**. Its only functional change is to the iOS frameworks' `Info.plist` (see `serious_python_darwin` 4.4.2); no versions moved and the Android runtime is unchanged from 20260726.
+
+## 4.4.1
+
+* Re-pins the bundled python-build snapshot to **20260726**. Its only functional change is an iOS privacy-manifest fix (see `serious_python_darwin` 4.4.1); no versions moved and the Android runtime is unchanged from 20260725.
+
+## 4.4.0
+
+* Re-pins the bundled python-build snapshot to **20260725** (`dart_bridge` **1.5.1 → 1.6.1**). 1.6.1 changes only how `dart_bridge` is packaged for Apple platforms (static library → dynamic framework, see `serious_python_darwin` 4.4.0); the Android runtime is byte-identical to 20260720.
+
+## 4.3.6
+
+* **PEP 734 subinterpreters now work** (Python 3.14 `concurrent.interpreters` / `InterpreterPoolExecutor`) — enabling true multi-core CPU parallelism inside a single process, which `multiprocessing` cannot provide on Android. Previously the main interpreter imported the machinery fine, but every subinterpreter raised `ModuleNotFoundError` for `_struct` / `_interpqueues` / any other C extension, so `InterpreterPoolExecutor` and the low-level API were unusable. Cause: Android relocates C extensions (native-mmap packaging) and resolves them through `_SorefFinder` on `sys.meta_path`; `sys.meta_path` is per-interpreter, and `install()` only ran in the main interpreter, so a freshly created subinterpreter had a `meta_path` without the finder. Fix: `_sp_bootstrap.install()` now also wraps `concurrent.interpreters.create()` so every new interpreter installs the finder before use. The install runs via `Interpreter.exec()` — a source string, which is pickle-free (unlike `Interpreter.call()`), so it works *before* `_struct` is importable in the child. Because `InterpreterPoolExecutor` builds its workers via `concurrent.interpreters.create()`, the pool is fixed transparently with no user-code change. A no-op before 3.14; iOS/desktop were unaffected.
+* Re-pins the bundled python-build snapshot to **20260720** (`dart_bridge` **1.5.0 → 1.5.1**). 1.5.1 is a Windows-only UTF-8 startup fix (see `serious_python_windows` 4.3.6); the Android runtime is functionally unchanged from 20260719.
+
+## 4.3.4
+
+* Re-pins the bundled python-build snapshot to **20260719** (previously 20260714). The snapshot un-prunes `_pyrepl` on Windows/Linux desktop only; Android already shipped `_pyrepl` (un-pruned in 4.3.2), so these runtimes are byte-identical to 20260714.
+* **Android:** fix code edits not taking effect under `flet debug android` — the app kept running the previously-unpacked, stale code after a re-run ([flet-dev/flet#6682](https://github.com/flet-dev/flet/issues/6682)). `prepareApp` copies the app payload out of the APK only when its cache key changes, and the key was `versionName+versionCode`. Since `flet debug` reinstalls the same-version APK on each iteration (`flutter run` does an update install that preserves app data, including the cache marker), the key never changed and re-extraction was skipped. The key now also includes `PackageManager.lastUpdateTime`, which is bumped on every (re)install but stays stable across plain relaunches — so a debug reinstall re-extracts the new code while ordinary relaunches still hit the cache. `flet build apk` was unaffected (fresh/version-bumped install).
+
+## 4.3.3
+
+* Version bump aligning with the `serious_python_*` 4.3.3 release (a Windows build fix). No Android-affecting changes.
+
 ## 4.3.2
 
-* Bump the bundled python-build snapshot to `20260712`, fixing two on-device crashes on Python **3.13/3.14** (3.12 is unaffected; Python/`dart_bridge` versions are unchanged):
+* **Resolve a package whose `__init__` is itself the native extension.** `_SorefFinder` only probed `<dotted>.soref`, so a package that ships its extension as `<pkg>/__init__.<abi>.so` — e.g. apsw (import name `apsw`), whose relocation marker lands at `apsw/__init__.soref` — was never resolved: `find_spec` returned `None`, the synthesized empty `apsw/__init__.py` won, and `import apsw` yielded an empty module (`AttributeError: module 'apsw' has no attribute 'Connection'`). `find_spec` now falls back to `<dotted>/__init__.soref`, loads the extension under the correct top-level name via `ExtensionFileLoader`, and marks the result a package (with `submodule_search_locations`) so pure-Python submodules (`apsw.ext`, …) still resolve.
+* Bump the bundled python-build snapshot to `20260714`, fixing two on-device crashes on Python **3.13/3.14** (3.12 is unaffected; Python/`dart_bridge` versions are unchanged):
   * Apps died with `SIGSYS` at `dlopen()` of `libpython` — before the interpreter even started — on **x86_64/x86/armeabi-v7a**: mimalloc (bundled with CPython since 3.13) reads `/proc/sys/vm/overcommit_memory` during allocator init via a bare `open(2)` syscall, which Android's bionic seccomp policy forbids (only `openat(2)` is allowed). python-build now patches the call to `SYS_openat(AT_FDCWD, …)`. `arm64-v8a` was latently unaffected (no `SYS_open` there, so mimalloc already went through libc `open()` → `openat`), but emulators are typically x86_64.
   * `_pyrepl` is no longer pruned from the bundled stdlib: Python 3.14's `pdb` imports it at module load, so anything importing `pdb` (e.g. pytest's debugging plugin) died with `ModuleNotFoundError: No module named '_pyrepl'`.
 

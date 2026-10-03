@@ -2,9 +2,62 @@
 
 * Use the release CPython and `dart_bridge` ABI in every Windows Flutter build mode, including Debug, so standard native extension wheels from PyPI can be imported.
 
+## 5.0.0
+
+* Align with the serious_python **5.0.0** release ([#253](https://github.com/flet-dev/serious-python/pull/253)).
+
+## 4.7.2
+
+* Align with the serious_python **4.7.2** release ([#252](https://github.com/flet-dev/serious-python/pull/252)).
+
+## 4.7.1
+
+* Update the python-build snapshot to **20260921** and `dart_bridge` to **1.10.0**. CPython versions remain **3.12.14 / 3.13.15 / 3.14.7**. ([python-build#42](https://github.com/flet-dev/python-build/pull/42))
+
+## 4.7.0
+
+* Re-pins the bundled python-build snapshot to **20260908** and `dart_bridge` to **1.9.0**, whose `dart_bridge.dll` adds the `serious_python_hard_exit` export behind `DartBridge.hardExit`. No CPython versions change from 4.6.0 - **3.12.14 / 3.13.15 / 3.14.7** are unchanged.
+
+## 4.6.0
+
+* **The bundled Windows runtimes move to CPython 3.12.14 / 3.13.15 / 3.14.7** (from 3.12.13 / 3.13.14 / 3.14.6). All three are security releases: they fix a quadratic-complexity DoS in incremental `html.parser.HTMLParser` parsing ([gh-153030](https://github.com/python/cpython/issues/153030)) and quadratic behaviour in `xml.etree.ElementTree` XPath index predicates ([gh-152674](https://github.com/python/cpython/issues/152674)), among others. 3.13.15 and 3.14.7 still bundle libexpat **2.8.2**; only 3.12.14 carries **2.8.3** with the [CVE-2026-72522](https://github.com/python/cpython/issues/155558) fix — see the `serious_python` 4.6.0 notes.
+* Re-pins the bundled python-build snapshot to **20260902** and `dart_bridge` to **1.8.0**.
+
+## 4.5.1
+
+* Re-pins the bundled python-build snapshot to **20260730** and `dart_bridge` to **1.7.1**. Both exist to sign the Apple XCFrameworks on both layers (see `serious_python_darwin` 4.5.1); no Python version moved from 20260729 (**3.12.13 / 3.13.14 / 3.14.6**), and nothing about Windows changed.
+
+## 4.5.0
+
+* Re-pins the bundled python-build snapshot to **20260729** and `dart_bridge` to **1.7.0**. Both exist to provider-sign the Apple XCFrameworks (see `serious_python_darwin` 4.5.0); no Python version moved from 20260727 (**3.12.13 / 3.13.14 / 3.14.6**). `dart_bridge.dll` is rebuilt rather than byte-identical — MSVC stamps a build timestamp and PDB GUID into every DLL — but no Windows source changed between 1.6.1 and 1.7.0.
+
+## 4.4.2
+
+* Re-pins the bundled python-build snapshot to **20260727**. Its only functional change is to the iOS frameworks' `Info.plist` (see `serious_python_darwin` 4.4.2); no versions moved and the Windows runtime is unchanged from 20260726.
+
+## 4.4.1
+
+* Re-pins the bundled python-build snapshot to **20260726**. Its only functional change is an iOS privacy-manifest fix (see `serious_python_darwin` 4.4.1); no versions moved and the Windows runtime is unchanged from 20260725.
+
+## 4.4.0
+
+* Re-pins the bundled python-build snapshot to **20260725** (`dart_bridge` **1.5.1 → 1.6.1**). 1.6.1 is an Apple-only packaging change (see `serious_python_darwin` 4.4.0); the Windows runtime is byte-identical to 20260720.
+
+## 4.3.6
+
+* **Fix Windows startup when app paths or environment values contain non-ASCII characters.** Dart FFI strings arrive as UTF-8, but the Windows boundary passed them straight to the ANSI CRT (`_putenv_s`, `fopen`), corrupting paths/env values through the process code page. The runtime now converts UTF-8 → UTF-16 and uses the wide CRT APIs (`_wputenv_s`, `_wfopen_s`), enables Python UTF-8 mode before `Py_Initialize()`, sets `PYTHONUTF8=1` for multiprocessing helpers, and treats embedded env-setup failures as fatal. Delivered via `dart_bridge` **1.5.1** (bundled python-build snapshot re-pinned to **20260720**). ([flet-dev/flet#6641](https://github.com/flet-dev/flet/issues/6641))
+
+## 4.3.4
+
+* **Fix `ModuleNotFoundError: No module named '_pyrepl'` on Python 3.14.** `_pyrepl` was pruned from the bundled Windows stdlib as a dev-only / interactive-REPL module, but CPython 3.14's `pydoc` (and `pdb`) import it at module load — so any app importing `pydoc`/`pdb`/`pytest`, or a dependency that does (e.g. NLTK → `pydoc`), crashed at startup. `_pyrepl` is no longer pruned. Re-pins the bundled python-build snapshot to **20260719** (previously 20260714). ([flet-dev/serious-python#236](https://github.com/flet-dev/serious-python/issues/236))
+
+## 4.3.3
+
+* **Fix `flet build windows` failing on non-UTF-8 system locales** with `warning C4819` escalated to `error C2220` while compiling `serious_python_windows_plugin.cpp` (flet-dev/flet#6686). A source comment contained a non-ASCII character (an em dash); on a system whose code page isn't UTF-8 — e.g. code page **936/GBK** on Simplified-Chinese Windows — MSVC decodes the UTF-8 source as GBK, can't represent the byte sequence (C4819), and the Flutter template's `/WX` (warnings-as-errors) turns it into a fatal C2220. The character is removed, and the plugin now compiles with `/utf-8` so any future non-ASCII source byte is read correctly regardless of the build machine's code page. Bundled Python and `dart_bridge` versions are unchanged from 4.3.2.
+
 ## 4.3.2
 
-* Bump the bundled python-build snapshot to `20260712`; aligns with the `serious_python_*` 4.3.2 release. The release contains only Android/iOS runtime fixes — no Windows-affecting changes.
+* Bump the bundled python-build snapshot to `20260714`; aligns with the `serious_python_*` 4.3.2 release. The release contains only Android/iOS runtime fixes — no Windows-affecting changes.
 
 ## 4.3.1
 
